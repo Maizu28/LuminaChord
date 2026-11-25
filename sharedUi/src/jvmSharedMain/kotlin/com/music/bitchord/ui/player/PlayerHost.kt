@@ -148,8 +148,7 @@ interface PlayerHost {
     /** Casting to a network receiver. Absent, and so never drawn, where the platform has none. */
     val castState: StateFlow<CastUi> get() = NoCast
 
-    /**
-     * The BitChord watch app as an output: the watch plays the queue the way a
+    /** The BitChord watch app as an output: the watch plays the queue the way a
      * Cast receiver does. Absent, and so never drawn, where there is no watch.
      */
     val watchOutput: StateFlow<WatchOutputUi> get() = NoWatch
@@ -159,6 +158,12 @@ interface PlayerHost {
 
     /** Make the watch the speaker. */
     fun selectWatchOutput() = Unit
+
+    /** Connected desktop/mobile LuminaChord companion as an audio output / control target. */
+    val peerOutput: StateFlow<PeerOutputUi> get() = NoPeerOutput
+
+    /** Transfer or switch audio output to the connected companion device. */
+    fun selectPeerOutput() = Unit
 
     /** The device picker the output drawer's Cast row opens, in the pipeline dialog's card. */
     @Composable
@@ -227,6 +232,22 @@ internal fun MusicVideoSurface(
 ) = PlayerPlatform.host.MusicVideo(videoId, fit, onRenderedChanged, modifier)
 
 private val NoWatch = MutableStateFlow(WatchOutputUi())
+
+private val NoPeerOutput = MutableStateFlow(PeerOutputUi())
+
+/** What the output drawer needs to draw the connected Desktop/Mobile companion row. */
+data class PeerOutputUi(
+    /** True when a paired LuminaChord companion device is connected. */
+    val available: Boolean = false,
+    /** True on Android showing Desktop Windows; false on Desktop showing Android Mobile. */
+    val isDesktop: Boolean = true,
+    /** Display name of the companion device. */
+    val name: String? = null,
+    /** Optional status detail (e.g. currently playing track on companion). */
+    val subtitle: String? = null,
+    /** True when audio output / control focus is actively routed to this companion. */
+    val active: Boolean = false,
+)
 
 /** What the output drawer needs to draw the watch's row. */
 data class WatchOutputUi(

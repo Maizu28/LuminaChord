@@ -22,6 +22,7 @@ import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.CastConnected
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.Earbuds
 import androidx.compose.material.icons.rounded.GraphicEq
@@ -92,6 +93,7 @@ internal fun AudioOutputSheet(
     val outputs = rememberAudioOutputs()
     val cast by PlayerPlatform.host.castState.collectAsStateWithLifecycle()
     val watch by PlayerPlatform.host.watchOutput.collectAsStateWithLifecycle()
+    val peer by PlayerPlatform.host.peerOutput.collectAsStateWithLifecycle()
     // A watch comes and goes; ask again each time the drawer opens.
     LaunchedEffect(Unit) { PlayerPlatform.host.refreshWatchOutput() }
 
@@ -115,6 +117,9 @@ internal fun AudioOutputSheet(
                     accountName = accountName,
                     onSelect = { PlayerPlatform.host.selectAudioOutput(device.id) },
                 )
+            }
+            if (peer.available || peer.active) {
+                PeerOutputRow(peer = peer, onClick = { PlayerPlatform.host.selectPeerOutput() })
             }
             // One more place to send the music, listed with the others. The
             // receivers behind it are chosen in a popup of their own — there
@@ -273,6 +278,81 @@ private fun CastRow(cast: CastUi, onClick: () -> Unit) {
             tint = Color.White.copy(alpha = 0.35f),
             modifier = Modifier.size(20.dp),
         )
+    }
+}
+
+@Composable
+private fun PeerOutputRow(peer: PeerOutputUi, onClick: () -> Unit) {
+    val haptics = rememberHaptics()
+    val active = peer.active
+    val fallbackTitle = stringResource(
+        if (peer.isDesktop) Res.string.peer_output_desktop else Res.string.peer_output_mobile,
+    )
+    val fallbackSub = stringResource(
+        if (peer.isDesktop) Res.string.peer_output_desktop_subtitle else Res.string.peer_output_mobile_subtitle,
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(ROW_SHAPE)
+            .background(Color.White.copy(alpha = if (active) 0.10f else 0.05f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                enabled = !active,
+            ) {
+                haptics.play(Haptic.Select)
+                onClick()
+            }
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(Color.White.copy(alpha = if (active) 0.16f else 0.08f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = if (peer.isDesktop) Icons.Rounded.Computer else Icons.Rounded.PhoneAndroid,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = if (active) 1f else 0.7f),
+                modifier = Modifier.size(21.dp),
+            )
+        }
+        Spacer(Modifier.width(13.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = peer.name?.takeIf(String::isNotBlank) ?: fallbackTitle,
+                style = MaterialTheme.typography.bodyLarge.copy(
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                ),
+                color = Color.White.copy(alpha = if (active) 1f else 0.85f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = when {
+                    active -> peer.subtitle?.takeIf(String::isNotBlank) ?: stringResource(Res.string.audio_output_playing)
+                    !peer.subtitle.isNullOrBlank() -> peer.subtitle
+                    else -> fallbackSub
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = Color.White.copy(alpha = 0.55f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (active) {
+            Icon(
+                imageVector = Icons.Rounded.Check,
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(20.dp),
+            )
+        }
     }
 }
 

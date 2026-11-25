@@ -20,6 +20,7 @@ object JamInviteLink {
 
     private const val EXTRA_CONSUMED = "bitchord.jamInviteConsumed"
     private const val HOST = "bitchord.kushagrasingh.in"
+    private const val RENDER_HOST = "bitchord-listen-together.onrender.com"
     private const val CUSTOM_SCHEME = "bitchord"
     private const val CUSTOM_HOST = "party"
 
@@ -67,11 +68,12 @@ object JamInviteLink {
             return ParsedJamInvite(code = code, serverUrl = server)
         }
 
-        // 2. Official web domain: https://bitchord.kushagrasingh.in/invite/<CODE>
-        if (scheme == "https" && host == HOST) {
+        // 2. Official web domains: https://bitchord.kushagrasingh.in/invite/<CODE> or https://bitchord-listen-together.onrender.com/invite/<CODE>
+        if (scheme == "https" && (host == HOST || host == RENDER_HOST)) {
             val match = INVITE_PATH.matchEntire(uri.path.orEmpty()) ?: return null
             val code = match.groupValues[1].uppercase()
-            return ParsedJamInvite(code = code, serverUrl = server)
+            val resolvedServer = server ?: if (host == RENDER_HOST) "https://$RENDER_HOST" else null
+            return ParsedJamInvite(code = code, serverUrl = resolvedServer)
         }
 
         return null

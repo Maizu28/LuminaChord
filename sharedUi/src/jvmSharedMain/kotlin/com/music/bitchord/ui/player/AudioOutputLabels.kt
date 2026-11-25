@@ -1,6 +1,8 @@
 package com.music.bitchord.ui.player
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.music.bitchord.sharedui.resources.*
 import org.jetbrains.compose.resources.stringResource
 
@@ -34,6 +36,12 @@ internal fun outputLabel(device: AudioOutputDevice, accountName: String?): Strin
  */
 @Composable
 internal fun rememberAudioOutputName(accountName: String?): String {
+    val peer by PlayerPlatform.host.peerOutput.collectAsStateWithLifecycle()
+    if (peer.active) {
+        return peer.name?.takeIf(String::isNotBlank) ?: stringResource(
+            if (peer.isDesktop) Res.string.peer_output_desktop else Res.string.peer_output_mobile,
+        )
+    }
     val outputs = rememberAudioOutputs()
     val active = outputs.firstOrNull { it.isActive }
         ?: return if (accountName.isNullOrBlank()) {

@@ -206,6 +206,7 @@ fun SettingsScreen(
     onSources: () -> Unit,
     onListenTogether: () -> Unit,
     onWearOs: () -> Unit,
+    onDesktopSync: () -> Unit = {},
     onSpotifyCanvasAuth: () -> Unit,
     onAppLanguage: () -> Unit,
     onEditSignatureApi: () -> Unit,
@@ -610,6 +611,9 @@ fun SettingsScreen(
                         WearOsSettingsRow(onClick = onWearOs)
                     }
                 }
+                SettingsGroup {
+                    DesktopSyncSettingsRow(onClick = onDesktopSync)
+                }
             }
         }
 
@@ -647,7 +651,7 @@ fun SettingsScreen(
                     title = exportDownloadsTitle,
                     checked = exportDownloads,
                     onCheckedChange = AppSettings::setExportDownloads,
-                    subtitle = "Music/BitChord".takeIf { exportDownloads },
+                    subtitle = "Music/LuminaChord".takeIf { exportDownloads },
                 )
             }
             val syncPlaylistsTitle = stringResource(R.string.sync_downloaded_playlists)
@@ -1636,6 +1640,14 @@ fun SettingsScreen(
             }
         }
 
+        if (searching) {
+            SearchableSettingsGroup(search) {
+                row(stringResource(R.string.desktop_sync_section), "desktop", "windows", "pc", "sync", "computer", "luminachord") {
+                    DesktopSyncSettingsRow(onClick = onDesktopSync)
+                }
+            }
+        }
+
         if (shows(SettingsCategory.YOUR_DATA)) SearchableSettingsGroup(search, header = stringResource(R.string.your_data)) {
             val replayTitle = stringResource(R.string.replay)
             row(replayTitle, "stats", "history", "wrapped") {
@@ -1949,7 +1961,7 @@ fun SettingsScreen(
         if (section == null && searchQuery.isBlank()) {
         Text(
             text = buildAnnotatedString {
-                append("bitchord $version  ")
+                append("LuminaChord $version  ")
                 val linkStyles = TextLinkStyles(
                     style = SpanStyle(
                         color = MaterialTheme.colorScheme.primary,

@@ -159,6 +159,12 @@ import com.music.bitchord.ui.player.discardBlockedAutoMixAmbient
 import com.music.bitchord.ui.player.prefetchAutoMixArtwork
 import com.music.bitchord.widget.MediaWidget
 import com.music.bitchord.widget.MediaWidgetSnapshot
+import com.music.bitchord.widget.LyricCueResolver
+import com.music.bitchord.widget.LyricWidget
+import com.music.bitchord.widget.LyricWidgetState
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import androidx.core.content.ContextCompat
 import com.music.bitchord.wear.WearBridge
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -973,7 +979,13 @@ class PlaybackService : MediaLibraryService() {
 
     private var serviceLyricsJob: Job? = null
     private var serviceLyrics: List<LyricLine>? = null
+    private var serviceLyricsMediaId: String? = null
+    private var serviceLyricsLoading: Boolean = false
     private var lastPublishedSubtitle: String? = null
+    private var lastWidgetSecond: Long = -1L
+    private var lastWidgetCurrentLyric: String = ""
+    private var lastWidgetNextLyric: String = ""
+    private var lyricWidgetSyncReceiver: BroadcastReceiver? = null
     private var lyricsTickerJob: Job? = null
 
     /**
@@ -1205,6 +1217,15 @@ class PlaybackService : MediaLibraryService() {
             // The player this fired on, which is by definition the one the
             // session is currently pointed at.
             val exoPlayer = player ?: return
+            if (state == Player.STATE_READY) {
+                if (LyricWidget.hasPlacedWidgets(this@PlaybackService)) {
+                    exoPlayer.currentMediaItem?.toSong()?.let { song ->
+                        val pos = crossfade?.loopPositionMs() ?: exoPlayer.currentPosition
+                        updateLyricWidgetState(exoPlayer, song, serviceLyrics, pos, forceTick = true)
+                    }
+                    if (exoPlayer.isPlaying) startLyricsTicker()
+                }
+            }
             if (state == Player.STATE_ENDED) {
                 SleepTimer.cancel()
                 // The queue ran dry, so no transition will ever close the last
@@ -1451,6 +1472,28 @@ class PlaybackService : MediaLibraryService() {
         localBitrateCache.clear()
         measuredBitrateCache.clear()
         QualityUpgrade.forgetLastSession()
+
+        val widgetSyncFilter = IntentFilter(LyricWidget.ACTION_SYNC_LYRICS_WIDGET)
+        val syncReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val exoPlayer = player ?: return
+                val song = exoPlayer.currentMediaItem?.toSong() ?: return
+                if (serviceLyricsMediaId != song.videoId && !serviceLyricsLoading) {
+                    loadLyricsForCurrentTrack()
+                } else {
+                    val pos = crossfade?.loopPositionMs() ?: exoPlayer.currentPosition
+                    updateLyricWidgetState(exoPlayer, song, serviceLyrics, pos, forceTick = true)
+                }
+                if (exoPlayer.isPlaying) startLyricsTicker()
+            }
+        }
+        lyricWidgetSyncReceiver = syncReceiver
+        ContextCompat.registerReceiver(
+            this,
+            syncReceiver,
+            widgetSyncFilter,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
 
         setMediaNotificationProvider(
             DefaultMediaNotificationProvider.Builder(this)
@@ -8630,6 +8673,12 @@ class PlaybackService : MediaLibraryService() {
         serviceLyricsJob?.cancel()
         serviceLyricsJob = null
         serviceLyrics = null
+        serviceLyricsMediaId = null
+        serviceLyricsLoading = false
+        lyricWidgetSyncReceiver?.let {
+            runCatching { unregisterReceiver(it) }
+            lyricWidgetSyncReceiver = null
+        }
         cancelPrefetch()
         trackAnalyzer.release()
         loudnessRetryJob?.cancel()
@@ -8706,17 +8755,34 @@ class PlaybackService : MediaLibraryService() {
     private fun loadLyricsForCurrentTrack() {
         val currentSong = player?.currentMediaItem?.toSong() ?: run {
             serviceLyrics = null
+            serviceLyricsMediaId = null
+            serviceLyricsLoading = false
             stopLyricsTicker()
             return
         }
 
-        if (!AppSettings.syncedLyrics.value) {
+        val hasLyricWidgets = LyricWidget.hasPlacedWidgets(this)
+        if (!AppSettings.syncedLyrics.value && !hasLyricWidgets) {
             serviceLyrics = null
+            serviceLyricsMediaId = null
+            serviceLyricsLoading = false
             stopLyricsTicker()
             return
         }
 
         val trackDurationMs = (player?.duration ?: 0L).takeIf { it > 0 } ?: 0L
+        serviceLyricsMediaId = currentSong.videoId
+        serviceLyrics = null
+        serviceLyricsLoading = true
+        lastWidgetSecond = -1L
+        lastWidgetCurrentLyric = ""
+        lastWidgetNextLyric = ""
+        if (hasLyricWidgets) {
+            player?.let { exoPlayer ->
+                val pos = crossfade?.loopPositionMs() ?: exoPlayer.currentPosition
+                updateLyricWidgetState(exoPlayer, currentSong, lines = null, pos = pos, forceTick = true)
+            }
+        }
 
         serviceLyricsJob?.cancel()
         serviceLyricsJob = scope.launch(Dispatchers.IO) {
@@ -8739,9 +8805,16 @@ class PlaybackService : MediaLibraryService() {
                 lines = found?.lines?.takeIf(EmbeddedLyrics::isSynced) ?: embedded ?: found?.lines
             }
             withContext(Dispatchers.Main) {
+                if (player?.currentMediaItem?.toSong()?.videoId != currentSong.videoId) return@withContext
                 serviceLyrics = lines
+                serviceLyricsLoading = false
+                player?.let { exoPlayer ->
+                    val pos = crossfade?.loopPositionMs() ?: exoPlayer.currentPosition
+                    updateLyricWidgetState(exoPlayer, currentSong, lines, pos, forceTick = true)
+                }
                 if (player?.isPlaying == true) {
                     updateLyricSubtitle()
+                    startLyricsTicker()
                 }
             }
         }
@@ -8763,11 +8836,57 @@ class PlaybackService : MediaLibraryService() {
         updateLyricSubtitle()
     }
 
+    private fun updateLyricWidgetState(
+        exoPlayer: Player,
+        currentSong: Song,
+        lines: List<LyricLine>?,
+        pos: Long,
+        forceTick: Boolean,
+    ) {
+        if (!LyricWidget.hasPlacedWidgets(this)) return
+        val clampedPos = pos.coerceAtLeast(0L)
+        val durationMs = exoPlayer.duration.takeIf { it > 0L } ?: 0L
+        val resolved = LyricCueResolver.resolve(
+            lines = lines,
+            positionMs = clampedPos,
+            title = currentSong.title,
+            artist = currentSong.artist,
+            loadingLabel = getString(R.string.widget_lyric_loading),
+            unavailableLabel = getString(R.string.widget_lyric_unavailable),
+            lyricsLoading = serviceLyricsLoading && serviceLyricsMediaId == currentSong.videoId,
+        )
+        val currentSecond = clampedPos / 1_000L
+        val changed = forceTick ||
+            currentSecond != lastWidgetSecond ||
+            resolved.current != lastWidgetCurrentLyric ||
+            resolved.next != lastWidgetNextLyric
+        if (!changed) return
+
+        lastWidgetSecond = currentSecond
+        lastWidgetCurrentLyric = resolved.current
+        lastWidgetNextLyric = resolved.next
+
+        LyricWidgetState.save(
+            this,
+            LyricWidgetState(
+                mediaId = currentSong.videoId,
+                currentLyric = resolved.current,
+                nextLyric = resolved.next,
+                hasSyncedLyrics = resolved.hasSyncedLines,
+                lyricsLoading = serviceLyricsLoading && serviceLyricsMediaId == currentSong.videoId,
+                positionMs = clampedPos,
+                durationMs = durationMs,
+            ),
+        )
+        LyricWidget.tick(this)
+    }
+
     private fun updateLyricSubtitle() {
         val exoPlayer = player ?: return
         val currentSong = exoPlayer.currentMediaItem?.toSong() ?: return
         val lines = serviceLyrics
         val pos = crossfade?.loopPositionMs() ?: exoPlayer.currentPosition
+        updateLyricWidgetState(exoPlayer, currentSong, lines, pos, forceTick = false)
         val subtitleText = if (lines != null && lines.isNotEmpty() && AppSettings.syncedLyrics.value) {
             val idx = lines.indexOfLast { it.timeMs <= pos }
             val currentLine = lines.getOrNull(idx)

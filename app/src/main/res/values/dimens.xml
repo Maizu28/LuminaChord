@@ -37,4 +37,12 @@
     <dimen name="widget_pill_height">78dp</dimen>
     <dimen name="widget_pill_art">64dp</dimen>
     <dimen name="widget_button_pill">38dp</dimen>
+
+    <!-- Lyric 4x2 player and 4x1 capsule widgets -->
+    <dimen name="widget_lyric_cover_size">76dp</dimen>
+    <dimen name="widget_lyric_cover_radius">14dp</dimen>
+    <dimen name="widget_lyric_like_size">28dp</dimen>
+    <dimen name="widget_lyric_button_sm">28dp</dimen>
+    <dimen name="widget_lyric_button_lg">34dp</dimen>
+    <dimen name="widget_lyric_pill_height">68dp</dimen>
 </resources>

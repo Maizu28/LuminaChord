@@ -29,6 +29,7 @@ import com.composables.sfsymbols.monochrome.SFChevronBackward
 import com.composables.sfsymbols.monochrome.SFChevronRight
 import com.composables.sfsymbols.monochrome.SFCircleLefthalfFilled
 import com.composables.sfsymbols.monochrome.SFClock
+import com.composables.sfsymbols.monochrome.SFDesktopcomputer
 import com.composables.sfsymbols.monochrome.SFClockArrowTriangleheadCounterclockwiseRotate90
 import com.composables.sfsymbols.monochrome.SFDocumentOnDocument
 import com.composables.sfsymbols.monochrome.SFDotRadiowavesLeftAndRight
@@ -151,6 +152,7 @@ object SfIcons {
     val CloudOff: ImageVector by lazy { bold(SfSymbols.Monochrome.SFIcloudSlash) }
     val ContentCopy: ImageVector by lazy { bold(SfSymbols.Monochrome.SFDocumentOnDocument) }
     val DeleteSweep: ImageVector by lazy { bold(SfSymbols.Monochrome.SFTrash) }
+    val Desktop: ImageVector by lazy { bold(SfSymbols.Monochrome.SFDesktopcomputer) }
     val Dns: ImageVector by lazy { bold(SfSymbols.Monochrome.SFServerRack) }
     val Download: ImageVector by lazy { bold(SfSymbols.Monochrome.SFArrowDownCircle) }
     val DragHandle: ImageVector by lazy { bold(SfSymbols.Monochrome.SFLine3Horizontal) }

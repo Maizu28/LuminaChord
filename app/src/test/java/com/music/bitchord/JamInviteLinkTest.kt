@@ -108,6 +108,13 @@ class JamInviteLinkTest {
     }
 
     @Test
+    fun `parses official Render domain invite link`() {
+        val invite = JamInviteLink.parseInvite("https://bitchord-listen-together.onrender.com/invite/abc123")
+        assertEquals("ABC123", invite?.code)
+        assertEquals("https://bitchord-listen-together.onrender.com", invite?.serverUrl)
+    }
+
+    @Test
     fun `switch party result sealed hierarchy holds expected properties`() {
         val success: com.music.bitchord.data.listentogether.ListenTogether.SwitchPartyResult =
             com.music.bitchord.data.listentogether.ListenTogether.SwitchPartyResult.Success("ABC123")

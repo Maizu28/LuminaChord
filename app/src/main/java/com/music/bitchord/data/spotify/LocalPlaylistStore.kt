@@ -109,6 +109,39 @@ object LocalPlaylistStore {
         return _playlists.value.firstOrNull { it.id == cleanId || it.id == id || it.browseId == id }
     }
 
+    /**
+     * Merges playlists synced from LuminaChord Desktop into the local store without duplicating songs.
+     */
+    fun mergeFromSync(incoming: List<LocalPlaylist>): Int {
+        if (incoming.isEmpty()) return 0
+        val current = _playlists.value.toMutableList()
+        var mergedCount = 0
+        for (inList in incoming) {
+            val cleanTitle = inList.title.trim()
+            if (cleanTitle.isEmpty()) continue
+            val existingIdx = current.indexOfFirst {
+                it.id == inList.id || it.title.trim().equals(cleanTitle, ignoreCase = true)
+            }
+            if (existingIdx >= 0) {
+                val existing = current[existingIdx]
+                val seen = existing.songs.mapTo(HashSet()) { it.videoId }
+                val additions = inList.songs.filter { it.videoId.isNotBlank() && seen.add(it.videoId) }
+                if (additions.isNotEmpty()) {
+                    current[existingIdx] = existing.copy(songs = existing.songs + additions)
+                    mergedCount++
+                }
+            } else {
+                current.add(inList)
+                mergedCount++
+            }
+        }
+        if (mergedCount > 0) {
+            _playlists.value = current
+            persist(current)
+        }
+        return mergedCount
+    }
+
     private fun persist(list: List<LocalPlaylist>) {
         if (!this::prefs.isInitialized) return
         runCatching {

@@ -209,7 +209,7 @@ export function DiscordSettings() {
               <span>Name</span>
               <input
                 className={settingsUi.input}
-                placeholder="BitChord"
+                placeholder="LuminaChord"
                 value={options.activityName}
                 onChange={(e) => set({ activityName: e.currentTarget.value })}
               />
@@ -242,7 +242,7 @@ export function DiscordSettings() {
                 <span>BitChord button text</span>
                 <input
                   className={settingsUi.input}
-                  placeholder="Visit BitChord"
+                  placeholder="Visit LuminaChord"
                   value={options.button2Text}
                   onChange={(e) => set({ button2Text: e.currentTarget.value })}
                 />

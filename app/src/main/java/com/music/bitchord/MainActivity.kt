@@ -177,6 +177,7 @@ import com.music.bitchord.ui.screens.EqualizerPresetPage
 import com.music.bitchord.ui.screens.SettingsChoicePage
 import com.music.bitchord.ui.components.SpotifyImportAlert
 import com.music.bitchord.ui.screens.WearOsScreen
+import com.music.bitchord.ui.screens.DesktopSyncScreen
 import com.music.bitchord.ui.screens.DriveBackupScreen
 import com.music.bitchord.ui.screens.DriveDevicesScreen
 import com.music.bitchord.ui.screens.DriveBackupAlerts
@@ -262,10 +263,28 @@ import com.music.bitchord.ui.components.SongActionsMenu
 import com.music.bitchord.ui.components.HeldContextMenu
 import com.music.bitchord.ui.components.HeldItem
 import androidx.media3.session.MediaController
+import com.music.bitchord.playback.PlayerState
 import com.music.bitchord.playback.QualityUpgrade
 import com.music.bitchord.playback.rememberMediaController
 import com.music.bitchord.playback.rememberPlayerState
 import com.music.bitchord.playback.setQueueDragActive
+import com.music.bitchord.sync.DesktopSyncManager
+import com.music.bitchord.sync.DesktopSyncStatus
+import com.music.bitchord.sync.overlayClearQueue
+import com.music.bitchord.sync.overlayCurrentPlaybackSong
+import com.music.bitchord.sync.overlayCycleRepeat
+import com.music.bitchord.sync.overlayJumpTo
+import com.music.bitchord.sync.overlayNext
+import com.music.bitchord.sync.overlayPrevious
+import com.music.bitchord.sync.overlayPreviousRestarts
+import com.music.bitchord.sync.overlayRemoveFromQueue
+import com.music.bitchord.sync.overlayRemoveQueueEntries
+import com.music.bitchord.sync.overlaySeekFraction
+import com.music.bitchord.sync.overlaySeekMs
+import com.music.bitchord.sync.overlayTogglePlayPause
+import com.music.bitchord.sync.rememberDesktopOverlayState
+import com.music.bitchord.sync.resolveOverlayLyrics
+import com.music.bitchord.ui.LyricsProviderState
 import com.music.bitchord.ui.MainViewModel
 import com.music.bitchord.ui.SearchSource
 import com.music.bitchord.ui.components.BottomFadeScrim
@@ -1126,7 +1145,19 @@ private fun BitChordApp(
         }
     }
     val controller = rememberMediaController()
-    val player = rememberPlayerState(controller)
+    val localPlayer = rememberPlayerState(controller)
+    val localShuffleEnabled by QueueShuffle.enabled.collectAsStateWithLifecycle()
+    val desktopOverlay = rememberDesktopOverlayState(
+        controller = controller,
+        localPlayer = localPlayer,
+        localShuffleEnabled = localShuffleEnabled,
+    )
+    val usingDesktopOutput = desktopOverlay.usingDesktopOutput
+    val desktopNowPlaying = desktopOverlay.desktopNowPlaying
+    val desktopLyricsState = desktopOverlay.desktopLyrics
+    val player = desktopOverlay.player
+    val shuffleEnabled = desktopOverlay.shuffleEnabled
+
     val queueUndo by QueueScreenUndo.notice.collectAsStateWithLifecycle()
     // A music video's picture follows this controller's clock — see [MusicVideoEngine].
     DisposableEffect(controller) {
@@ -1139,11 +1170,11 @@ private fun BitChordApp(
     // Folded into the buffering flag every play button already answers to, since
     // to a listener the two are the same fact: it is coming, wait.
     val awaitingPartyStart by ListenTogether.awaitingStart.collectAsStateWithLifecycle()
-    val playPauseBusy = player.isLoading || awaitingPartyStart
+    val playPauseBusy = if (usingDesktopOutput) (desktopNowPlaying?.isLoading == true) else (localPlayer.isLoading || awaitingPartyStart)
     // Listening in a party whose host has taken the controls. Read once here
     // and handed to every surface, so the player, the mini player and the glass
     // bar can never disagree about whether this device may drive the music.
-    val controlsLocked = partyState.controlsLocked
+    val controlsLocked = if (usingDesktopOutput) false else partyState.controlsLocked
     var queueNotice by remember { mutableStateOf<QueueActionNotice?>(null) }
     var queueNoticeId by remember { mutableIntStateOf(0) }
     var queueUndoNotice by remember { mutableStateOf<QueueActionNotice?>(null) }
@@ -1194,18 +1225,8 @@ private fun BitChordApp(
      * of starting a second of audio that [PartySync] then has to stop.
      */
     val togglePlayPause: () -> Unit = {
-        controller?.let { c ->
-            val party = ListenTogether.state.value
-            if (party.controlsLocked && !party.playback.isPlaying && !c.isPlaying) {
-                showHostOnlyNotice()
-            } else if (c.isPlaying) {
-                c.pause()
-            } else {
-                c.play()
-            }
-        }
+        overlayTogglePlayPause(usingDesktopOutput, controller, showHostOnlyNotice)
     }
-    val shuffleEnabled by QueueShuffle.enabled.collectAsStateWithLifecycle()
     // For the version switch's "there is no other version" notice.
     val versionContext = LocalContext.current
     // Tracks whose other cut a switch looked for and didn't find: their menu
@@ -1592,6 +1613,10 @@ private fun BitChordApp(
         activeRadioSeed = null
         scope.launch {
             if (refusedByHost()) return@launch
+            if (DesktopSyncManager.desktopOutputActive.value && DesktopSyncManager.status.value is DesktopSyncStatus.Connected) {
+                DesktopSyncManager.playSongsOnDesktop(songs, index)
+                return@launch
+            }
             val c = controller ?: return@launch
             val currentTimeline = player.queue.takeIf { it.size == c.mediaItemCount }
                 ?: (0 until c.mediaItemCount).map { c.getMediaItemAt(it).toSong() }
@@ -1684,6 +1709,10 @@ private fun BitChordApp(
         activeRadioSeed = null
         scope.launch {
             if (refusedByHost()) return@launch
+            if (DesktopSyncManager.desktopOutputActive.value && DesktopSyncManager.status.value is DesktopSyncStatus.Connected) {
+                DesktopSyncManager.playSongsOnDesktop(listOf(song), 0)
+                return@launch
+            }
             val c = controller ?: return@launch
             val currentTimeline = player.queue.takeIf { it.size == c.mediaItemCount }
                 ?: (0 until c.mediaItemCount).map { c.getMediaItemAt(it).toSong() }
@@ -1842,6 +1871,11 @@ private fun BitChordApp(
     val addToQueue: (Song) -> Unit = { song ->
         scope.launch {
             if (refusedByHost()) return@launch
+            if (DesktopSyncManager.desktopOutputActive.value && DesktopSyncManager.status.value is DesktopSyncStatus.Connected) {
+                DesktopSyncManager.enqueueOnDesktop(song, playNext = false)
+                showQueueNotice(context.getString(R.string.song_added_to_queue))
+                return@launch
+            }
             // The end of what the user queued, not the end of the queue: a song
             // asked for by name outranks whatever AutoPlay lined up behind it.
             controller?.let {
@@ -1874,6 +1908,11 @@ private fun BitChordApp(
     val playNext: (Song) -> Unit = { song ->
         scope.launch {
             if (refusedByHost()) return@launch
+            if (DesktopSyncManager.desktopOutputActive.value && DesktopSyncManager.status.value is DesktopSyncStatus.Connected) {
+                DesktopSyncManager.enqueueOnDesktop(song, playNext = true)
+                showQueueNotice(context.getString(R.string.song_will_play_next))
+                return@launch
+            }
             controller?.let {
                 if (ListenTogether.state.value.inParty) {
                     val upcoming = (it.mediaItemCount - (it.currentMediaItemIndex + 1)).coerceAtLeast(0)
@@ -1982,6 +2021,20 @@ private fun BitChordApp(
         if (songs.isNotEmpty()) {
             scope.launch {
                 if (refusedByHost()) return@launch
+                if (DesktopSyncManager.desktopOutputActive.value && DesktopSyncManager.status.value is DesktopSyncStatus.Connected) {
+                    if (next) {
+                        songs.asReversed().forEach { DesktopSyncManager.enqueueOnDesktop(it, playNext = true) }
+                    } else {
+                        songs.forEach { DesktopSyncManager.enqueueOnDesktop(it, playNext = false) }
+                    }
+                    val message = context.resources.getQuantityString(
+                        if (next) R.plurals.songs_will_play_next else R.plurals.songs_added_to_queue,
+                        songs.size,
+                        songs.size,
+                    )
+                    showQueueNotice(message)
+                    return@launch
+                }
                 val c = controller
                 if (c == null || c.mediaItemCount == 0) {
                     // Nothing to queue behind. "Add to queue" on a silent
@@ -2587,6 +2640,7 @@ private fun BitChordApp(
         linksLoading = false
         if (!playerShowing) return@LaunchedEffect
         val current = player.song ?: return@LaunchedEffect
+        if (current.videoId.startsWith("local:") || current.videoId.startsWith("desktop:")) return@LaunchedEffect
         if (current.albumId != null && current.artistId != null) return@LaunchedEffect
         linksLoading = true
         links = YtMusicRepository.trackLinks(current.videoId).getOrNull()
@@ -2640,6 +2694,15 @@ private fun BitChordApp(
                         it.memberId == playback.startedBy
                     }?.displayName?.takeIf(String::isNotBlank)
             }
+        val overlayLyrics = resolveOverlayLyrics(
+            usingDesktopOutput = usingDesktopOutput,
+            desktopLyricsState = desktopLyricsState,
+            displayedSongVideoId = displayedSong.videoId,
+            localLyrics = lyrics,
+            localSource = lyricsSource,
+            localProviderStates = lyricsProviderStates,
+            lyricsChecked = lyricsChecked,
+        )
         NowPlayingScreen(
             song = displayedSong,
             playedBy = playedBy,
@@ -2656,59 +2719,14 @@ private fun BitChordApp(
             durationMs = player.durationMs,
             audioVersionSwitching = switchingAudioVersion,
             qualityUpgraded = player.isQualityUpgraded,
-            onPlayPause = {
-                togglePlayPause()
-            },
-            onNext = { controller?.seekToNextMediaItem() },
-            onPrevious = { controller?.seekToPrevious() },
-            previousRestarts = {
-                controller?.let {
-                    it.currentPosition > it.maxSeekToPreviousPosition || !it.hasPreviousMediaItem()
-                } ?: true
-            },
-            currentPlaybackSong = { controller?.currentMediaItem?.toSong() },
+            onPlayPause = { togglePlayPause() },
+            onNext = { overlayNext(usingDesktopOutput, controller) },
+            onPrevious = { overlayPrevious(usingDesktopOutput, controller) },
+            previousRestarts = { overlayPreviousRestarts(usingDesktopOutput, player, controller) },
+            currentPlaybackSong = { overlayCurrentPlaybackSong(usingDesktopOutput, desktopNowPlaying, controller) },
             onBlockedControl = showHostOnlyNotice,
-            onSeekFraction = { fraction ->
-                controller?.let { player ->
-                    // Read at the moment of the seek, not from the
-                    // polled snapshot the screen draws with: a track
-                    // change updates the current item before it updates
-                    // the duration, so a fraction dropped seconds after
-                    // a transition would otherwise be scaled by the
-                    // previous song's length.
-                    val duration = player.duration
-                    if (duration > 0) {
-                        player.seekTo(
-                            (fraction * duration).toLong()
-                                .coerceIn(0L, (duration - SEEK_END_GUARD_MS).coerceAtLeast(0L)),
-                        )
-                    }
-                }
-            },
-            onSeek = { target ->
-                controller?.let { player ->
-                    // Clamped here rather than at each caller because
-                    // not every caller can clamp. The scrubber's target
-                    // is a fraction of the duration and cannot overrun,
-                    // but a tapped lyric line seeks to a timestamp from
-                    // whichever transcription matched on title, artist
-                    // and duration — and a match against a slightly
-                    // longer master puts every line late, so a tap near
-                    // the end asks for a position past the end of this
-                    // stream. Media3 answers that by clamping to the
-                    // final millisecond, which ends the track and starts
-                    // the next one: tapping the last line of a song
-                    // skipped it.
-                    val duration = player.duration
-                    player.seekTo(
-                        if (duration > 0) {
-                            target.coerceIn(0L, (duration - SEEK_END_GUARD_MS).coerceAtLeast(0L))
-                        } else {
-                            target.coerceAtLeast(0L)
-                        },
-                    )
-                }
-            },
+            onSeekFraction = { overlaySeekFraction(usingDesktopOutput, player.durationMs, controller, it, SEEK_END_GUARD_MS) },
+            onSeek = { overlaySeekMs(usingDesktopOutput, player.durationMs, controller, it, SEEK_END_GUARD_MS) },
             queue = player.queue,
             queueIndex = player.queueIndex,
             hasPrevious = player.hasPrevious,
@@ -2717,67 +2735,28 @@ private fun BitChordApp(
             shuffleEnabled = shuffleEnabled,
             autoplayEnabled = autoplayEnabled,
             signedIn = signedIn,
-            likeStatus = likeStatusOf(song),
-            onToggleLike = { toggleLikeOf(song) },
-            // The service owns both the queue and the Shuffle state. Keeping
-            // the toggle on that side prevents the UI from changing the icon
-            // before its asynchronous reorder command has actually landed.
-            onToggleShuffle = { controller?.toggleShuffle() },
-            onCycleRepeat = {
-                controller?.let {
-                    val next = when (it.repeatMode) {
-                        Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
-                        Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
-                        else -> Player.REPEAT_MODE_OFF
-                    }
-                    // Persist the new repeat mode so it survives app restarts.
-                    AppSettings.setRepeatMode(next)
-                    // Nothing else to do here: PlaybackService watches the
-                    // repeat mode itself and takes AutoPlay's tracks out of
-                    // the queue for the duration of repeat-all — and, unlike
-                    // this screen, is still around to put them back when the
-                    // loop ends.
-                    it.repeatMode = next
-                }
+            likeStatus = if (usingDesktopOutput) {
+                if (desktopNowPlaying?.isLiked == true) LikeStatus.LIKE else LikeStatus.INDIFFERENT
+            } else {
+                likeStatusOf(song)
             },
-            onToggleAutoplay = {
-                // PlaybackService owns the setting and queue extension so
-                // this path and the notification use exactly one loader.
-                controller?.toggleAutoplay()
+            onToggleLike = {
+                if (usingDesktopOutput) DesktopSyncManager.toggleLikeOnDesktop(song.videoId)
+                else toggleLikeOf(song)
             },
-            onJumpTo = { index ->
-                controller?.let { c ->
-                    // The session applies the jump plan to its own player (see
-                    // its seekTo override); editing the queue from here would
-                    // round-trip every item through the controller and lose
-                    // their bounded-window metadata.
-                    val historySong = player.queue.getOrNull(index)
-                        ?.takeIf { index < c.currentMediaItemIndex }
-                    if (historySong == null) {
-                        c.seekTo(index, 0L)
-                        c.play()
-                    } else {
-                        // A history row plays again at the playhead, so what was
-                        // played after it stays history rather than coming back
-                        // as upcoming. The seek is the service's fallback.
-                        scope.launch {
-                            if (!c.replayFromHistory(index, historySong)) c.seekTo(index, 0L)
-                            c.play()
-                        }
-                    }
-                }
+            onToggleShuffle = {
+                if (usingDesktopOutput) DesktopSyncManager.toggleShuffleOnDesktop()
+                else controller?.toggleShuffle()
             },
-            onRemoveFromQueue = { index ->
-                val queueSong = player.queue.getOrNull(index)
-                val c = controller
-                if (c != null && queueSong != null) scope.launch { c.removeQueueItemWithUndo(index, queueSong) }
+            onCycleRepeat = { overlayCycleRepeat(usingDesktopOutput, controller) },
+            onToggleAutoplay = { if (!usingDesktopOutput) controller?.toggleAutoplay() },
+            onJumpTo = { overlayJumpTo(usingDesktopOutput, player, controller, scope, it) },
+            onRemoveFromQueue = { overlayRemoveFromQueue(usingDesktopOutput, player, controller, scope, it) },
+            onQueueSwipeToQueue = { index, queueSong ->
+                if (usingDesktopOutput) false else controller?.moveQueueEntryToUser(index, queueSong) ?: false
             },
-            onQueueSwipeToQueue = { index, queueSong -> controller?.moveQueueEntryToUser(index, queueSong) ?: false },
             onQueueBulkAction = performQueueBulkAction,
-            onQueueRemoveEntries = { entries ->
-                controller?.removeQueueEntriesWithUndo(entries)
-                Unit
-            },
+            onQueueRemoveEntries = { overlayRemoveQueueEntries(usingDesktopOutput, player, controller, it) },
             onQueueAddAllToPlaylist = { songs ->
                 scope.launch { performQueueBulkAction(songs, QueueBulkAction.PLAYLIST) }
             },
@@ -2794,7 +2773,10 @@ private fun BitChordApp(
                     },
                 )
             },
-            onMoveInQueue = { from, to -> controller?.moveMediaItem(from, to) },
+            onMoveInQueue = { from, to ->
+                if (usingDesktopOutput) DesktopSyncManager.moveInDesktopQueue(from, to)
+                else controller?.moveMediaItem(from, to)
+            },
             onQueueDragActiveChange = { active -> controller?.setQueueDragActive(active) },
             onQueueSongMenu = { _, queueSong ->
                 menuFromQueue = true
@@ -2917,11 +2899,11 @@ private fun BitChordApp(
                     PlaybackSourceType.QUEUE -> Unit
                 }
             },
-            lyrics = lyrics,
-            lyricsSource = lyricsSource,
-            lyricsProviderStates = lyricsProviderStates,
+            lyrics = overlayLyrics.lines,
+            lyricsSource = overlayLyrics.source,
+            lyricsProviderStates = overlayLyrics.providerStates,
             onSelectLyricsProvider = viewModel::selectLyricsProvider,
-            lyricsUnavailable = lyricsChecked && lyrics.isNullOrEmpty(),
+            lyricsUnavailable = overlayLyrics.unavailable,
             lyricsOffsetOpen = showLyricsOffset,
             onDismissLyricsOffset = { showLyricsOffset = false },
             onListenTogether = {
@@ -2930,12 +2912,7 @@ private fun BitChordApp(
                 dismissPlayer()
                 navigator.pushAll(AppRoute.Settings, AppRoute.ListenTogether)
             },
-            onClearQueue = {
-                // Keep what's playing and context/autoplay; drop user-queued tracks.
-                controller?.let { c ->
-                    scope.launch { c.clearUserQueueWithUndo() }
-                }
-            },
+            onClearQueue = { overlayClearQueue(usingDesktopOutput, controller, scope) },
         )
     }
 
@@ -3230,6 +3207,8 @@ private fun BitChordApp(
                             )
                         } else if (pageRoute == AppRoute.WearOs) {
                             WearOsScreen(contentPadding = listPadding)
+                        } else if (pageRoute == AppRoute.DesktopSync) {
+                            DesktopSyncScreen(contentPadding = listPadding)
                         } else if (pageRoute == AppRoute.DriveBackup) {
                             DriveBackupScreen(
                                 contentPadding = listPadding,
@@ -3304,6 +3283,7 @@ private fun BitChordApp(
                                 onSources = { navigator.push(AppRoute.Sources) },
                                 onListenTogether = { navigator.push(AppRoute.ListenTogether) },
                                 onWearOs = { navigator.push(AppRoute.WearOs) },
+                                onDesktopSync = { navigator.push(AppRoute.DesktopSync) },
                                 onSpotifyCanvasAuth = { showSpotifyCanvasAuth = true },
                                 onAppLanguage = { showAppLanguage = true },
                                 onEditSignatureApi = { editingSignatureApi = true },
@@ -4001,6 +3981,7 @@ private fun BitChordApp(
                         AppRoute.Sources -> stringResource(R.string.sources)
                         AppRoute.ListenTogether -> stringResource(R.string.listen_together)
                         AppRoute.WearOs -> stringResource(R.string.wear_os_page_title)
+                        AppRoute.DesktopSync -> stringResource(R.string.desktop_sync_page_title)
                         AppRoute.DriveBackup -> stringResource(R.string.drive_backup_title)
                         AppRoute.DriveDevices -> stringResource(R.string.drive_devices_title)
                         AppRoute.Equalizer -> stringResource(R.string.equalizer)
@@ -4410,8 +4391,8 @@ private fun BitChordApp(
                         onPlayPause = {
                             togglePlayPause()
                         },
-                        onNext = { controller?.seekToNextMediaItem() },
-                        onPrevious = { controller?.seekToPrevious() },
+                        onNext = { overlayNext(usingDesktopOutput, controller) },
+                        onPrevious = { overlayPrevious(usingDesktopOutput, controller) },
                         onExpand = if (reducePlayerMotion) {
                             { showNowPlaying = true }
                         } else {
@@ -4450,8 +4431,8 @@ private fun BitChordApp(
                             onPlayPause = {
                                 togglePlayPause()
                             },
-                            onNext = { controller?.seekToNextMediaItem() },
-                            onPrevious = { controller?.seekToPrevious() },
+                            onNext = { overlayNext(usingDesktopOutput, controller) },
+                            onPrevious = { overlayPrevious(usingDesktopOutput, controller) },
                             onExpand = if (reducePlayerMotion) {
                                 { showNowPlaying = true }
                             } else {

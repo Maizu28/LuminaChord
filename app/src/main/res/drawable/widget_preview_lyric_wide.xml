@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="280dp"
+    android:height="118dp"
+    android:viewportWidth="280"
+    android:viewportHeight="118">
+    <path android:pathData="M22,0L258,0A22,22 0,0 1,280 22L280,96A22,22 0,0 1,258 118L22,118A22,22 0,0 1,0 96L0,22A22,22 0,0 1,22 0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="280"
+                android:endY="118"
+                android:startX="0"
+                android:startY="0"
+                android:type="linear">
+                <item android:color="#FF3A3154" android:offset="0" />
+                <item android:color="#FF211E35" android:offset="0.55" />
+                <item android:color="#FF151324" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path
+        android:pathData="M22,0.8L258,0.8A21.2,21.2 0,0 1,279.2 22L279.2,96A21.2,21.2 0,0 1,258 117.2L22,117.2A21.2,21.2 0,0 1,0.8 96L0.8,22A21.2,21.2 0,0 1,22 0.8Z"
+        android:strokeColor="#59FFFFFF"
+        android:strokeWidth="1.2" />
+
+    <!-- Square rounded album cover -->
+    <path
+        android:fillColor="#FF4A3F6D"
+        android:pathData="M26,20L76,20A12,12 0,0 1,88 32L88,82A12,12 0,0 1,76 94L26,94A12,12 0,0 1,14 82L14,32A12,12 0,0 1,26 20Z"
+        android:strokeColor="#40FFFFFF"
+        android:strokeWidth="0.9" />
+
+    <!-- Waveform + title/artist bars -->
+    <path
+        android:pathData="M99,24L99,27M102,22L102,29M105,20L105,31M108,22L108,29M111,24L111,27"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="1.4" />
+    <path android:pathData="M119,23L175,23" android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" android:strokeWidth="5" />
+    <path android:pathData="M119,32L152,32" android:strokeColor="#99FFFFFF" android:strokeLineCap="round" android:strokeWidth="3.5" />
+
+    <!-- Top-right heart glass circle -->
+    <path
+        android:fillColor="#26FFFFFF"
+        android:pathData="M254,18A11,11 0,1 1,254 40A11,11 0,1 1,254 18Z"
+        android:strokeColor="#59FFFFFF"
+        android:strokeWidth="0.9" />
+
+    <!-- Synced lyric bars -->
+    <path android:pathData="M100,53L210,53" android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" android:strokeWidth="6" />
+    <path android:pathData="M100,66L224,66" android:strokeColor="#99FFFFFF" android:strokeLineCap="round" android:strokeWidth="4.5" />
+
+    <!-- Progress track & dot -->
+    <path android:pathData="M100,87L186,87" android:strokeColor="#40FFFFFF" android:strokeLineCap="round" android:strokeWidth="2.4" />
+    <path android:pathData="M100,87L136,87" android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" android:strokeWidth="2.6" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M136,84A3,3 0,1 1,136 90A3,3 0,1 1,136 84Z" />
+
+    <!-- Bottom-right transport glass circles -->
+    <path android:fillColor="#26FFFFFF" android:pathData="M206,77A10,10 0,1 1,206 97A10,10 0,1 1,206 77Z" android:strokeColor="#52FFFFFF" android:strokeWidth="0.8" />
+    <path android:fillColor="#3BFFFFFF" android:pathData="M231,74A13,13 0,1 1,231 100A13,13 0,1 1,231 74Z" android:strokeColor="#70FFFFFF" android:strokeWidth="1" />
+    <path android:fillColor="#26FFFFFF" android:pathData="M256,77A10,10 0,1 1,256 97A10,10 0,1 1,256 77Z" android:strokeColor="#52FFFFFF" android:strokeWidth="0.8" />
+</vector>

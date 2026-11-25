@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Tells Wi-Fi from mobile data, so the matching quality ceiling applies. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
@@ -20,6 +22,10 @@
          for a USB DAC. A normal permission, granted at install. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!-- Camera for scanning LuminaChord Desktop Sync QR code -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!--
       Asked for only when the output picker is first opened, and only on API 31+
@@ -72,7 +78,7 @@
         android:name=".BitChordApplication"
         android:allowBackup="true"
         android:appCategory="audio"
-        android:usesCleartextTraffic="false"
+        android:usesCleartextTraffic="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -723,6 +729,32 @@
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_media_pill" />
+        </receiver>
+
+        <!-- The 4×2 Liquid Glass Lyric Player widget. -->
+        <receiver
+            android:name=".widget.LyricWidgetWide"
+            android:exported="false"
+            android:label="@string/widget_lyric_wide_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_lyric_wide" />
+        </receiver>
+
+        <!-- The 4×1 Liquid Glass Lyric Only capsule widget. -->
+        <receiver
+            android:name=".widget.LyricWidgetPill"
+            android:exported="false"
+            android:label="@string/widget_lyric_pill_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_lyric_pill" />
         </receiver>
 
         <!-- Quick Settings tile: play or pause the last queue. See PlaybackTile. -->

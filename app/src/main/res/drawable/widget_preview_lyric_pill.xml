@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="280dp"
+    android:height="66dp"
+    android:viewportWidth="280"
+    android:viewportHeight="66">
+    <path android:pathData="M33,0L247,0A33,33 0,0 1,280 33L280,33A33,33 0,0 1,247 66L33,66A33,33 0,0 1,0 33L0,33A33,33 0,0 1,33 0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="280"
+                android:endY="66"
+                android:startX="0"
+                android:startY="0"
+                android:type="linear">
+                <item android:color="#FF3A3256" android:offset="0" />
+                <item android:color="#FF211E35" android:offset="0.55" />
+                <item android:color="#FF19172A" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path
+        android:pathData="M33,0.8L247,0.8A32.2,32.2 0,0 1,279.2 33L279.2,33A32.2,32.2 0,0 1,247 65.2L33,65.2A32.2,32.2 0,0 1,0.8 33L0.8,33A32.2,32.2 0,0 1,33 0.8Z"
+        android:strokeColor="#59FFFFFF"
+        android:strokeWidth="1.2" />
+
+    <!-- Left 5-bar waveform -->
+    <path
+        android:pathData="M24,30L24,36M28.5,27L28.5,39M33,22L33,44M37.5,27L37.5,39M42,30L42,36"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.1" />
+
+    <!-- Divider -->
+    <path
+        android:pathData="M55,20L55,46"
+        android:strokeColor="#52FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="1.2" />
+
+    <!-- Current & next lyric lines -->
+    <path android:pathData="M68,26L214,26" android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" android:strokeWidth="6.5" />
+    <path android:pathData="M68,41L234,41" android:strokeColor="#99FFFFFF" android:strokeLineCap="round" android:strokeWidth="5" />
+</vector>

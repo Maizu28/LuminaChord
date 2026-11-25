@@ -30,6 +30,8 @@ import com.music.bitchord.playback.AutoMixVisualFeed
 import com.music.bitchord.playback.audio.bitperfect.BitPerfectOutput
 import com.music.bitchord.playback.audio.bitperfect.DacVolume
 import com.music.bitchord.playback.cast.CastController
+import com.music.bitchord.sync.DesktopSyncManager
+import com.music.bitchord.sync.DesktopSyncStatus
 import com.music.bitchord.ui.components.backdrop.backdrops.SnapshotBackdrop
 import com.music.bitchord.ui.components.backdrop.backdrops.rememberSnapshotBackdrop
 import com.music.bitchord.ui.components.backdrop.backdrops.snapshotBackdropSource
@@ -164,20 +166,49 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         val outputs = rememberAndroidAudioOutputs()
         val cast by CastController.state.collectAsStateWithLifecycle()
         val watch by WearBridge.watchOutput.collectAsStateWithLifecycle()
-        // While a receiver is the speaker no output of this phone is the one
-        // playing, so none of them is lit; the Cast or watch row is.
-        return if (cast.casting || watch.active) outputs.map { it.copy(isActive = false) } else outputs
+        val peer by peerOutput.collectAsStateWithLifecycle()
+        // While a receiver or paired PC is the speaker no output of this phone is the one
+        // playing, so none of them is lit; the Cast, Desktop, or watch row is.
+        return if (cast.casting || watch.active || peer.active) outputs.map { it.copy(isActive = false) } else outputs
     }
 
     @Composable
     override fun rememberOutputPicker(onOpen: () -> Unit): () -> Unit = rememberAndroidOutputPicker(onOpen)
 
     override fun selectAudioOutput(id: Int?) {
-        // Picking an output of this phone is picking this phone: the receiver
+        // Picking an output of this phone is picking this phone: the receiver / PC
         // is let go of, and the music carries on here if it was playing.
         if (CastController.state.value.casting) CastController.disconnect(resumeHere = true)
+        if (DesktopSyncManager.desktopOutputActive.value) DesktopSyncManager.switchOutputToMobile(handoffFromDesktop = true)
         AudioRouting.select(id)
         WearBridge.leaveWatchOutput()
+    }
+
+    override val peerOutput: StateFlow<PeerOutputUi> by lazy {
+        combine(
+            DesktopSyncManager.status,
+            DesktopSyncManager.desktopOutputActive,
+            DesktopSyncManager.desktopNowPlaying,
+        ) { status, active, np ->
+            val connected = status as? DesktopSyncStatus.Connected
+            PeerOutputUi(
+                available = connected != null,
+                isDesktop = true,
+                name = connected?.deviceName ?: "LuminaChord Desktop (Windows)",
+                subtitle = when {
+                    active && np != null -> "Memutar di PC · ${np.title}"
+                    np != null -> "PC memutar: ${np.title} · Ketuk untuk pindah/kontrol"
+                    else -> null
+                },
+                active = active && connected != null,
+            )
+        }.stateIn(scope, SharingStarted.Eagerly, PeerOutputUi())
+    }
+
+    override fun selectPeerOutput() {
+        if (CastController.state.value.casting) CastController.disconnect(resumeHere = false)
+        WearBridge.leaveWatchOutput()
+        DesktopSyncManager.switchOutputToDesktop(handoffIfMobilePlaying = true)
     }
 
     override val watchOutput: StateFlow<WatchOutputUi> by lazy {
@@ -192,6 +223,7 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         // One speaker at a time: a receiver lets go first, quietly, and the
         // watch picks the queue up from where the phone's player is.
         if (CastController.state.value.casting) CastController.disconnect(resumeHere = false)
+        DesktopSyncManager.setDesktopOutputActive(false)
         WearBridge.selectWatchOutput()
     }
 
@@ -323,8 +355,18 @@ private class CastAwareVolume(
         CastController.state.map { it.casting },
         WearBridge.watchOutput,
         DacVolume.level,
-    ) { phone, receiver, casting, watch, dac ->
+        DesktopSyncManager.desktopOutputActive,
+        DesktopSyncManager.desktopNowPlaying,
+    ) { values ->
+        val phone = values[0] as Float
+        val receiver = values[1] as Float
+        val casting = values[2] as Boolean
+        val watch = values[3] as com.music.bitchord.wear.WatchOutputState
+        val dac = values[4] as Float?
+        val desktopActive = values[5] as Boolean
+        val desktopNp = values[6] as com.music.bitchord.sync.DesktopNowPlayingTrack?
         when {
+            desktopActive && desktopNp != null -> desktopNp.volume.coerceIn(0f, 1f)
             casting -> receiver
             watch.active -> watch.volume
             // Direct USB: the music stream no longer reaches the DAC, so its
@@ -337,6 +379,7 @@ private class CastAwareVolume(
 
     override fun set(level: Float) {
         when {
+            DesktopSyncManager.desktopOutputActive.value -> DesktopSyncManager.setDesktopVolume(level)
             CastController.state.value.casting -> CastController.setVolume(level)
             WearBridge.watchOutput.value.active -> WearBridge.setWatchVolume(level)
             DacVolume.level.value != null -> DacVolume.set(level)

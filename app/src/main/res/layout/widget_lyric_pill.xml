@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_lyric_pill_outer"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <FrameLayout
+        android:id="@+id/widget_lyric_pill_root"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/widget_lyric_pill_height"
+        android:layout_gravity="center_vertical"
+        android:background="@drawable/widget_lyric_pill_bg_fallback">
+
+        <ImageView
+            android:id="@+id/widget_lyric_pill_bg"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:importantForAccessibility="no"
+            android:scaleType="fitXY" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingLeft="20dp"
+            android:paddingRight="22dp">
+
+            <ImageView
+                android:id="@+id/widget_lyric_pill_wave"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_lyric_wave" />
+
+            <ImageView
+                android:layout_width="1dp"
+                android:layout_height="28dp"
+                android:layout_marginLeft="14dp"
+                android:layout_marginRight="14dp"
+                android:importantForAccessibility="no"
+                android:src="@drawable/widget_lyric_vertical_divider" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/widget_lyric_pill_current"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:fontFamily="@font/sf_pro_display_semibold"
+                    android:includeFontPadding="false"
+                    android:maxLines="1"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:id="@+id/widget_lyric_pill_next"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2.5dp"
+                    android:ellipsize="end"
+                    android:fontFamily="@font/sf_pro_display_regular"
+                    android:includeFontPadding="false"
+                    android:maxLines="1"
+                    android:textColor="#ADFFFFFF"
+                    android:textSize="12.5sp" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+</FrameLayout>
