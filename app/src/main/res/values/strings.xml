@@ -1544,4 +1544,12 @@
     <string name="replay_year_summary_minutes">Minutes listened</string>
     <string name="replay_year_mute">Mute the story</string>
     <string name="replay_year_unmute">Unmute the story</string>
+    <string name="download_format">Download format</string>
+    <string name="download_format_dialog_subtitle">Lossless FLAC tracks remain FLAC when available; other tracks save in the selected format.</string>
+    <string name="download_format_mp3_detail">Universal compatibility across players &amp; devices</string>
+    <string name="download_format_webm_detail">Compact Opus audio in a WebM container</string>
+    <string name="download_folder">Download folder</string>
+    <string name="download_folder_all_subtitle">/storage/emulated/0/LuminaChord/Music (follows Local Music)</string>
+    <string name="download_folder_custom_subtitle">%1$s · Also used for downloads</string>
+    <string name="all_files_permission_required_save">Allow All Files Access or choose a Local Music folder to keep downloads outside app data.</string>
 </resources>

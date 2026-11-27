@@ -127,6 +127,15 @@ enum class DownloadQuality(
     ),
 }
 
+enum class DownloadFormat(
+    val extension: String,
+    val mimeType: String,
+    val label: String,
+) {
+    MP3("mp3", "audio/mpeg", "MP3"),
+    WEBM("webm", "audio/webm", "WebM"),
+}
+
 enum class ThemeMode(val label: String) {
     SYSTEM("System"), LIGHT("Light"), DARK("Dark")
 }
@@ -229,6 +238,9 @@ object AppSettings {
      */
     val downloadQuality = MutableStateFlow(DownloadQuality.LOSSLESS)
 
+    /** Output container/codec for non-FLAC downloads (`MP3` by default, or `WebM`). */
+    val downloadFormat = MutableStateFlow(DownloadFormat.MP3)
+
     /**
      * Refuse to start a download while the connection charges for data.
      *
@@ -252,7 +264,7 @@ object AppSettings {
      * HLS downloads always stay private because they are a playlist package,
      * not one portable audio file.
      */
-    val exportDownloads = MutableStateFlow(false)
+    val exportDownloads = MutableStateFlow(true)
 
     /**
      * Check the playlists downloaded whole for newly added songs and download
@@ -1052,8 +1064,9 @@ object AppSettings {
         ).coerceIn(MIN_UPGRADE_LENGTH_SLACK_SECONDS, MAX_UPGRADE_LENGTH_SLACK_SECONDS)
         migrateDownloadQuality()
         downloadQuality.value = readDownloadQuality()
+        downloadFormat.value = readDownloadFormat()
         wifiOnlyDownloads.value = prefs.getBoolean(KEY_WIFI_ONLY_DOWNLOADS, true)
-        exportDownloads.value = prefs.getBoolean(KEY_EXPORT_DOWNLOADS, false)
+        exportDownloads.value = prefs.getBoolean(KEY_EXPORT_DOWNLOADS, true)
         syncDownloadedPlaylists.value = prefs.getBoolean(KEY_SYNC_DOWNLOADED_PLAYLISTS, false)
         downloadLikedSongs.value = prefs.getBoolean(KEY_DOWNLOAD_LIKED_SONGS, false)
         crossfadeSeconds.value = prefs.getInt(KEY_CROSSFADE, 0)
@@ -1375,6 +1388,16 @@ object AppSettings {
     fun setDownloadQuality(value: DownloadQuality) {
         downloadQuality.value = value
         prefs.edit().putString(KEY_QUALITY_DOWNLOAD, value.name).apply()
+    }
+
+    private fun readDownloadFormat(): DownloadFormat {
+        val stored = prefs.getString(KEY_DOWNLOAD_FORMAT, null) ?: return DownloadFormat.MP3
+        return runCatching { DownloadFormat.valueOf(stored) }.getOrDefault(DownloadFormat.MP3)
+    }
+
+    fun setDownloadFormat(value: DownloadFormat) {
+        downloadFormat.value = value
+        prefs.edit().putString(KEY_DOWNLOAD_FORMAT, value.name).apply()
     }
 
     fun setWifiOnlyDownloads(value: Boolean) {
@@ -2419,6 +2442,7 @@ object AppSettings {
     private const val KEY_QUALITY_CELLULAR = "audio_quality_cellular"
     private const val KEY_UPGRADE_LENGTH_SLACK_SECONDS = "upgrade_length_slack_seconds"
     private const val KEY_QUALITY_DOWNLOAD = "audio_quality_download"
+    private const val KEY_DOWNLOAD_FORMAT = "download_format"
     private const val KEY_WIFI_ONLY_DOWNLOADS = "wifi_only_downloads"
     private const val KEY_EXPORT_DOWNLOADS = "export_downloads"
     private const val KEY_SYNC_DOWNLOADED_PLAYLISTS = "sync_downloaded_playlists"

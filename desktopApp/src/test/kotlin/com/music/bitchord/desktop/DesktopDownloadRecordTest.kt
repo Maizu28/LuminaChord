@@ -115,4 +115,107 @@ class DesktopDownloadRecordTest {
         assertTrue(saved.localUri!!.startsWith("file:"))
         assertTrue(saved.localUri!!.contains("%20"))
     }
+
+    @Test
+    fun `download directory follows selected local folder or defaults to LuminaChord Music`() {
+        val chosen = scratch.resolve("MyMusic")
+        assertEquals(chosen, DesktopDownloadManager.directory(selectedLocalFolder = chosen, windows = true))
+        assertEquals(
+            java.nio.file.Path.of("C:\\LuminaChord\\Music"),
+            DesktopDownloadManager.directory(selectedLocalFolder = null, windows = true),
+        )
+        assertEquals(
+            java.nio.file.Path.of(System.getProperty("user.home"), "LuminaChord", "Music"),
+            DesktopDownloadManager.directory(selectedLocalFolder = null, windows = false),
+        )
+    }
+
+    @Test
+    fun `download format defaults to MP3 and preserves lossless FLAC`() {
+        assertEquals(DesktopDownloadFormat.MP3, DesktopDownloadFormat.fromPreference(""))
+        assertEquals(DesktopDownloadFormat.WEBM, DesktopDownloadFormat.fromPreference("webm"))
+        assertEquals("flac", DesktopDownloadManager.targetExtension("flac", DesktopDownloadFormat.MP3))
+        assertEquals("flac", DesktopDownloadManager.targetExtension("FLAC", DesktopDownloadFormat.WEBM))
+        assertEquals("mp3", DesktopDownloadManager.targetExtension("m4a", DesktopDownloadFormat.MP3))
+        assertEquals("mp3", DesktopDownloadManager.targetExtension("webm", DesktopDownloadFormat.MP3))
+        assertEquals("webm", DesktopDownloadManager.targetExtension("m4a", DesktopDownloadFormat.WEBM))
+    }
+
+    @Test
+    fun `migrating legacy downloads moves files and recovers surviving tracks`() {
+        val legacyDir = scratch.resolve("legacy-BitChord").also { Files.createDirectories(it) }
+        val targetDir = scratch.resolve("LuminaChord-Music").also { Files.createDirectories(it) }
+        val trackedFile = legacyDir.resolve("NIKI - Take A Chance With Me.webm").also {
+            Files.write(it, ByteArray(4096) { 1 })
+        }
+        val orphanLegacy = legacyDir.resolve("Lady Gaga - Paparazzi.mp3").also {
+            Files.write(it, ByteArray(4096) { 2 })
+        }
+        val alreadyTarget = targetDir.resolve("Existing - Track.mp3").also {
+            Files.write(it, ByteArray(4096) { 3 })
+        }
+        val recorded = listOf(song("yt-1", trackedFile.toAbsolutePath().toString()))
+
+        val outcome = DesktopDownloadManager.migrateLegacyDownloads(
+            recorded = recorded,
+            targetDir = targetDir,
+            legacyDir = legacyDir,
+            adoptTargetUnrecorded = true,
+        )
+
+        assertTrue(outcome.changed)
+        assertFalse(Files.exists(trackedFile))
+        assertFalse(Files.exists(orphanLegacy))
+        assertTrue(Files.exists(targetDir.resolve("NIKI - Take A Chance With Me.webm")))
+        assertTrue(Files.exists(targetDir.resolve("Lady Gaga - Paparazzi.mp3")))
+        assertTrue(Files.exists(alreadyTarget))
+        val migrated = outcome.downloads.first { it.videoId == "yt-1" }
+        assertEquals(targetDir.resolve("NIKI - Take A Chance With Me.webm").toString(), migrated.localPath)
+        assertEquals(3, outcome.downloads.size)
+    }
+
+    @Test
+    fun `ffmpeg encoder converts wav audio into valid mp3 and webm files`() {
+        val wav = writeTestWav(scratch.resolve("tone.wav"))
+        val track = Song(videoId = "enc-1", title = "Tone", artist = "Tester", thumbnailUrl = "")
+
+        val mp3Out = scratch.resolve("out.mp3")
+        DesktopDownloadEncoder.transcode(wav, mp3Out, DesktopDownloadFormat.MP3, "HIGH", track)
+        val mp3Header = Files.readAllBytes(mp3Out).take(3)
+        assertTrue(Files.size(mp3Out) > 512L)
+        assertEquals(listOf('I'.code.toByte(), 'D'.code.toByte(), '3'.code.toByte()), mp3Header)
+
+        val webmOut = scratch.resolve("out.webm")
+        DesktopDownloadEncoder.transcode(wav, webmOut, DesktopDownloadFormat.WEBM, "HIGH", track)
+        val webmHeader = Files.readAllBytes(webmOut).take(4).map { it.toInt() and 0xFF }
+        assertTrue(Files.size(webmOut) > 512L)
+        assertEquals(listOf(0x1A, 0x45, 0xDF, 0xA3), webmHeader)
+    }
+
+    private fun writeTestWav(path: java.nio.file.Path): java.nio.file.Path {
+        val sampleRate = 44100
+        val channels = 2
+        val samples = sampleRate / 2 // 0.5 seconds
+        val dataBytes = samples * channels * 2
+        val out = java.io.ByteArrayOutputStream(44 + dataBytes)
+        fun writeAscii(s: String) = out.write(s.toByteArray(Charsets.US_ASCII))
+        fun writeIntLe(v: Int) {
+            out.write(v and 0xFF); out.write((v ushr 8) and 0xFF)
+            out.write((v ushr 16) and 0xFF); out.write((v ushr 24) and 0xFF)
+        }
+        fun writeShortLe(v: Int) {
+            out.write(v and 0xFF); out.write((v ushr 8) and 0xFF)
+        }
+        writeAscii("RIFF"); writeIntLe(36 + dataBytes); writeAscii("WAVE")
+        writeAscii("fmt "); writeIntLe(16); writeShortLe(1); writeShortLe(channels)
+        writeIntLe(sampleRate); writeIntLe(sampleRate * channels * 2)
+        writeShortLe(channels * 2); writeShortLe(16)
+        writeAscii("data"); writeIntLe(dataBytes)
+        for (i in 0 until samples * channels) {
+            val s = (kotlin.math.sin(2.0 * kotlin.math.PI * 440.0 * (i / channels) / sampleRate) * 12000).toInt()
+            writeShortLe(s)
+        }
+        Files.write(path, out.toByteArray())
+        return path
+    }
 }

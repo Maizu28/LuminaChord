@@ -1108,8 +1108,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * playlist the user has to add to again.
      */
     fun createPlaylist(title: String, privacy: PlaylistPrivacy, song: Song? = null) {
-        if (!requireSignIn()) return
         val name = title.trim().ifBlank { text(R.string.new_playlist) }
+        if (!authStore.isSignedIn || (song != null && song.localUri != null)) {
+            com.music.bitchord.data.spotify.LocalPlaylistStore.savePlaylist(name, listOfNotNull(song))
+            return
+        }
         viewModelScope.launch {
             YtMusicRepository.createPlaylist(
                 title = name,
@@ -3187,7 +3190,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         com.music.bitchord.data.spotify.LocalPlaylistStore.getPlaylist(browseId)?.let { playlist ->
-            return nonEmpty(playlist.songs) { text(R.string.spotify_import_empty_playlist) }
+            val hasUnresolvedLocal = playlist.songs.any {
+                it.localUri == null && (it.videoId.startsWith("local:") || it.localPath != null)
+            }
+            val resolvedSongs = if (hasUnresolvedLocal && LocalMediaRepository.hasStoragePermission(context)) {
+                val catalog by lazy { kotlinx.coroutines.runBlocking { LocalMediaRepository.getLocalMusic(context) } }
+                playlist.songs.map { song ->
+                    com.music.bitchord.data.PlaylistStorage.resolveSong(song, localCatalogProvider = { catalog })
+                }
+            } else {
+                playlist.songs
+            }
+            return nonEmpty(resolvedSongs) { text(R.string.spotify_import_empty_playlist) }
         }
         remoteLibrary(browseId)?.let { return remoteSongsState(it) }
         LocalGroups.folderOf(browseId)?.let { folderId ->

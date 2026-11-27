@@ -21,9 +21,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.awt.awtEventOrNull
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.text.font.FontFamily
@@ -172,7 +174,7 @@ internal data class ShortcutBinding(
 
     fun matches(event: KeyEvent): Boolean {
         if (event.type != KeyEventType.KeyDown) return false
-        val rawCode = event.key.nativeKeyCode
+        val rawCode = DesktopShortcutSettings.extractRawKeyCode(event)
         if (rawCode != keyCode) return false
 
         val ctrlMatch = if (DesktopPlatform.isMac) {
@@ -182,8 +184,9 @@ internal data class ShortcutBinding(
         }
         val altMatch = event.isAltPressed == alt
         val shiftMatch = event.isShiftPressed == shift
+        val metaMatch = DesktopPlatform.isMac || event.isMetaPressed == meta
 
-        return ctrlMatch && altMatch && shiftMatch
+        return ctrlMatch && altMatch && shiftMatch && metaMatch
     }
 
     fun serialize(): String = "$keyCode:$ctrl:$alt:$shift:$meta"
@@ -216,10 +219,48 @@ internal object DesktopShortcutSettings {
     var isRecording: Boolean = false
 
     /**
+     * Window-level preview key dispatcher hooked directly into [androidx.compose.ui.window.Window]
+     * so shortcuts still fire even when no child composable currently holds Compose focus.
+     */
+    @Volatile
+    var windowKeyHandler: ((KeyEvent) -> Boolean)? = null
+
+    fun dispatchWindowKeyEvent(event: KeyEvent): Boolean =
+        windowKeyHandler?.invoke(event) == true
+
+    private val typingTokens = java.util.Collections.synchronizedSet(mutableSetOf<Any>())
+
+    /**
      * Set to true whenever any editable text field or search field currently has focus in the application.
      */
     @Volatile
     var isTypingActive: Boolean = false
+
+    fun setTypingFocus(token: Any, focused: Boolean) {
+        synchronized(typingTokens) {
+            if (focused) typingTokens.add(token) else typingTokens.remove(token)
+            isTypingActive = typingTokens.isNotEmpty()
+        }
+    }
+
+    internal fun clearTypingFocus() {
+        synchronized(typingTokens) {
+            typingTokens.clear()
+            isTypingActive = false
+        }
+    }
+
+    internal fun extractRawKeyCode(event: KeyEvent): Int {
+        val raw = event.awtEventOrNull?.keyCode?.takeIf { it != AwtKeyEvent.VK_UNDEFINED }
+            ?: event.key.nativeKeyCode
+        return when (raw) {
+            AwtKeyEvent.VK_KP_LEFT -> AwtKeyEvent.VK_LEFT
+            AwtKeyEvent.VK_KP_RIGHT -> AwtKeyEvent.VK_RIGHT
+            AwtKeyEvent.VK_KP_UP -> AwtKeyEvent.VK_UP
+            AwtKeyEvent.VK_KP_DOWN -> AwtKeyEvent.VK_DOWN
+            else -> raw
+        }
+    }
 
     private fun loadInitialBindings(): Map<DesktopShortcutAction, ShortcutBinding> {
         val persistence = DesktopPersistence()
@@ -280,7 +321,7 @@ internal object DesktopShortcutSettings {
         onToggleLyrics: () -> Unit,
         onToggleQueue: () -> Unit,
         onToggleFullscreen: () -> Unit,
-        onBack: () -> Unit = {},
+        onBack: () -> Boolean = { false },
         onRefresh: () -> Unit = {},
     ): Boolean {
         if (event.type != KeyEventType.KeyDown || isRecording) return false
@@ -288,7 +329,7 @@ internal object DesktopShortcutSettings {
         // When the user is typing/focused in any text field or search field:
         // Do NOT intercept navigation or editing keys so cursor movement and text typing work normally!
         if (isTyping) {
-            val rawCode = event.key.nativeKeyCode
+            val rawCode = extractRawKeyCode(event)
             val isArrowKey = rawCode == AwtKeyEvent.VK_LEFT ||
                 rawCode == AwtKeyEvent.VK_RIGHT ||
                 rawCode == AwtKeyEvent.VK_UP ||
@@ -315,26 +356,42 @@ internal object DesktopShortcutSettings {
             }
 
             if (binding.matches(event)) {
-                when (action) {
-                    DesktopShortcutAction.PLAY_PAUSE -> onPlayPause()
-                    DesktopShortcutAction.NEXT_TRACK -> onNextTrack()
-                    DesktopShortcutAction.PREVIOUS_TRACK -> onPreviousTrack()
-                    DesktopShortcutAction.VOLUME_UP -> onVolumeUp()
-                    DesktopShortcutAction.VOLUME_DOWN -> onVolumeDown()
-                    DesktopShortcutAction.TOGGLE_MUTE -> onToggleMute()
-                    DesktopShortcutAction.SEEK_FORWARD -> onSeekForward()
-                    DesktopShortcutAction.SEEK_BACKWARD -> onSeekBackward()
-                    DesktopShortcutAction.FOCUS_SEARCH -> onFocusSearch()
-                    DesktopShortcutAction.TOGGLE_LYRICS -> onToggleLyrics()
-                    DesktopShortcutAction.TOGGLE_QUEUE -> onToggleQueue()
-                    DesktopShortcutAction.TOGGLE_FULLSCREEN -> onToggleFullscreen()
+                return when (action) {
+                    DesktopShortcutAction.PLAY_PAUSE -> { onPlayPause(); true }
+                    DesktopShortcutAction.NEXT_TRACK -> { onNextTrack(); true }
+                    DesktopShortcutAction.PREVIOUS_TRACK -> { onPreviousTrack(); true }
+                    DesktopShortcutAction.VOLUME_UP -> { onVolumeUp(); true }
+                    DesktopShortcutAction.VOLUME_DOWN -> { onVolumeDown(); true }
+                    DesktopShortcutAction.TOGGLE_MUTE -> { onToggleMute(); true }
+                    DesktopShortcutAction.SEEK_FORWARD -> { onSeekForward(); true }
+                    DesktopShortcutAction.SEEK_BACKWARD -> { onSeekBackward(); true }
+                    DesktopShortcutAction.FOCUS_SEARCH -> { onFocusSearch(); true }
+                    DesktopShortcutAction.TOGGLE_LYRICS -> { onToggleLyrics(); true }
+                    DesktopShortcutAction.TOGGLE_QUEUE -> { onToggleQueue(); true }
+                    DesktopShortcutAction.TOGGLE_FULLSCREEN -> { onToggleFullscreen(); true }
                     DesktopShortcutAction.BACK_OR_UNDO -> onBack()
-                    DesktopShortcutAction.REFRESH -> onRefresh()
+                    DesktopShortcutAction.REFRESH -> { onRefresh(); true }
                 }
-                return true
             }
         }
         return false
+    }
+}
+
+/** Tracks text input focus and guarantees cleanup if the field leaves composition while focused. */
+@Composable
+internal fun Modifier.trackDesktopTypingFocus(
+    onFocusChangedCallback: ((Boolean) -> Unit)? = null,
+): Modifier {
+    val token = remember { Any() }
+    DisposableEffect(token) {
+        onDispose {
+            DesktopShortcutSettings.setTypingFocus(token, false)
+        }
+    }
+    return onFocusChanged { focusState ->
+        DesktopShortcutSettings.setTypingFocus(token, focusState.isFocused)
+        onFocusChangedCallback?.invoke(focusState.isFocused)
     }
 }
 
@@ -348,6 +405,9 @@ internal fun DesktopKeyboardShortcutsDialog(onDismiss: () -> Unit) {
 
     LaunchedEffect(recordingAction) {
         DesktopShortcutSettings.isRecording = (recordingAction != null)
+    }
+    DisposableEffect(Unit) {
+        onDispose { DesktopShortcutSettings.isRecording = false }
     }
 
     DesktopDialogPanel(onDismiss = onDismiss, maxWidth = 640) {
@@ -529,7 +589,7 @@ internal fun DesktopKeyboardShortcutsDialog(onDismiss: () -> Unit) {
                                 return@onPreviewKeyEvent true
                             }
 
-                            val rawCode = event.key.nativeKeyCode
+                            val rawCode = DesktopShortcutSettings.extractRawKeyCode(event)
                             // Wait for a non-modifier key
                             if (rawCode != AwtKeyEvent.VK_CONTROL &&
                                 rawCode != AwtKeyEvent.VK_SHIFT &&

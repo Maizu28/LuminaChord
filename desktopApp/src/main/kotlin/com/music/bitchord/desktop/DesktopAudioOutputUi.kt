@@ -36,6 +36,7 @@ import com.music.bitchord.ui.icons.BitChordIcons
 internal fun DesktopAudioOutputDialog(onDismiss: () -> Unit) {
     val selected by DesktopAudioDevices.selected.collectAsState()
     val changes by DesktopAudioDevices.changes.collectAsState()
+    val peer by DesktopPlayerHost.peerOutput.collectAsState()
     val devices = remember(changes) { DesktopAudioDevices.available() }
     DesktopDialogPanel(onDismiss = onDismiss, maxWidth = 440) {
         Column(Modifier.padding(horizontal = panelInset(22.dp), vertical = 22.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -50,17 +51,27 @@ internal fun DesktopAudioOutputDialog(onDismiss: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
             )
             Spacer(Modifier.height(10.dp))
+            if (peer.available) {
+                OutputRow(
+                    name = peer.name ?: "LuminaChord Mobile",
+                    description = peer.subtitle ?: "Kontrol pemutaran & lihat lirik HP Android di Desktop",
+                    chosen = peer.active,
+                ) {
+                    DesktopPlayerHost.selectPeerOutput()
+                    onDismiss()
+                }
+            }
             OutputRow(
                 name = DesktopStrings["d_system_default", "System default"],
-                description = "",
-                chosen = selected == DesktopAudioDevices.SYSTEM_DEFAULT,
+                description = if (peer.active) "Pindahkan pemutaran kembali ke PC Windows" else "",
+                chosen = !peer.active && selected == DesktopAudioDevices.SYSTEM_DEFAULT,
             ) {
-                DesktopAudioDevices.select(DesktopAudioDevices.SYSTEM_DEFAULT)
+                DesktopPlayerHost.selectAudioOutput(null)
                 onDismiss()
             }
-            devices.forEach { device ->
-                OutputRow(device.name, device.description, chosen = selected == device.id) {
-                    DesktopAudioDevices.select(device.id)
+            devices.forEachIndexed { index, device ->
+                OutputRow(device.name, device.description, chosen = !peer.active && selected == device.id) {
+                    DesktopPlayerHost.selectAudioOutput(index + 1)
                     onDismiss()
                 }
             }

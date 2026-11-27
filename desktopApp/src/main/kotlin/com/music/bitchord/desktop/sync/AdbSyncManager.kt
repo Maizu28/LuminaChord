@@ -2,6 +2,7 @@ package com.music.bitchord.desktop.sync
 
 import com.music.bitchord.desktop.DesktopLocalMusic
 import com.music.bitchord.desktop.DesktopPersistence
+import com.music.bitchord.desktop.DesktopPlaylistStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,6 +55,7 @@ object AdbSyncManager {
 
     private const val KEY_ADB_AUTO_SYNC = "adb_auto_sync_enabled"
     private const val ANDROID_MUSIC_DIR = "/sdcard/Music/LuminaChord"
+    private const val ANDROID_PLAYLISTS_DIR = "/sdcard/LuminaChord/Playlists"
 
     private val _adbPath = MutableStateFlow<String?>(null)
     val adbPath: StateFlow<String?> = _adbPath.asStateFlow()
@@ -80,10 +82,31 @@ object AdbSyncManager {
 
     fun init(savedPersistence: DesktopPersistence) {
         persistence = savedPersistence
-        _autoSyncOnConnect.value = savedPersistence.boolean(KEY_ADB_AUTO_SYNC, false)
+        // Backend USB sync activates automatically whenever Sync is enabled on both Desktop & Android.
+        _autoSyncOnConnect.value = true
         probeAdb()
         startMonitor()
+        scope.launch {
+            var initialized = false
+            DesktopMobileSyncServer.isEnabled.collect {
+                if (!initialized) {
+                    initialized = true
+                    return@collect
+                }
+                if (_isAdbAvailable.value) {
+                    refreshDevicesNow()
+                }
+            }
+        }
     }
+
+    /** True only when Desktop Sync is active AND at least one connected USB phone has LuminaChord open. */
+    fun hasActiveAppTunnel(): Boolean =
+        DesktopMobileSyncServer.isEnabled.value &&
+            DesktopMobileSyncServer.isRunning.value &&
+            _isReverseActive.value &&
+            reversedSerials.isNotEmpty() &&
+            _connectedDevices.value.isNotEmpty()
 
     fun setAutoSyncOnConnect(enabled: Boolean) {
         _autoSyncOnConnect.value = enabled
@@ -177,21 +200,37 @@ object AdbSyncManager {
             }
             p.waitFor()
         }
-        _connectedDevices.value = list
-        val currentSerials = list.map { it.serial }.toSet()
-        if (list.isEmpty()) {
+        val syncActive = DesktopMobileSyncServer.isEnabled.value && DesktopMobileSyncServer.isRunning.value
+        val currentPort = DesktopMobileSyncServer.port.value
+        val readyList = if (syncActive) {
+            list.filter { device -> isLuminaChordOpenOnDevice(adb, device.serial) }
+        } else {
+            emptyList()
+        }
+        val readySerials = readyList.map { it.serial }.toSet()
+        for (staleSerial in reversedSerials - readySerials) {
+            removeReverseForSerial(adb, staleSerial, currentPort)
+        }
+        _connectedDevices.value = readyList
+        if (readyList.isEmpty()) {
             _isReverseActive.value = false
             reversedSerials = emptySet()
+            if (list.isNotEmpty() && !_isSyncing.value) {
+                _lastMessage.value = if (!syncActive) {
+                    "Fitur Sync Desktop nonaktif"
+                } else {
+                    "Menunggu aplikasi LuminaChord dibuka di perangkat Android"
+                }
+            }
         } else {
-            // Automatically establish USB reverse tunnel whenever an Android device is present
-            if (currentSerials != reversedSerials || !_isReverseActive.value) {
-                val ok = setupReverseInternal(adb, list, DesktopMobileSyncServer.port.value)
+            // Establish USB reverse tunnel only when Sync is active and LuminaChord is running on the phone
+            if (readySerials != reversedSerials || !_isReverseActive.value) {
+                val ok = setupReverseInternal(adb, readyList, currentPort)
                 _isReverseActive.value = ok
-                if (ok) reversedSerials = currentSerials
+                if (ok) reversedSerials = readySerials
             }
             if (!_isSyncing.value) {
-                val port = DesktopMobileSyncServer.port.value
-                _lastMessage.value = "${list.size} perangkat ADB terdeteksi (${list.joinToString { it.displayName }}) · Tunnel USB 127.0.0.1:$port aktif"
+                _lastMessage.value = "${readyList.size} perangkat LuminaChord aktif (${readyList.joinToString { it.displayName }})"
             }
         }
         return list
@@ -318,11 +357,18 @@ object AdbSyncManager {
                     }
                 }
 
+                // Also sync portable playlist files between C:\LuminaChord\Playlists and /sdcard/LuminaChord/Playlists
+                val (plPushed, plPulled) = syncPlaylistFiles(adb, dev, direction, onStatus)
+
                 val summary = buildString {
                     append("Sync ADB selesai: ")
                     if (pushedCount > 0) append("$pushedCount lagu dikirim ke HP. ")
                     if (pulledCount > 0) append("$pulledCount lagu diunduh ke PC. ")
-                    if (pushedCount == 0 && pulledCount == 0) append("Koleksi musik sudah sinkron.")
+                    if (plPushed > 0) append("$plPushed playlist dikirim ke HP. ")
+                    if (plPulled > 0) append("$plPulled playlist diunduh ke PC. ")
+                    if (pushedCount == 0 && pulledCount == 0 && plPushed == 0 && plPulled == 0) {
+                        append("Koleksi musik & playlist sudah sinkron.")
+                    }
                 }
                 _lastMessage.value = summary
                 onStatus(summary)
@@ -333,6 +379,79 @@ object AdbSyncManager {
                 _isSyncing.value = false
             }
         }
+    }
+
+    private fun syncPlaylistFiles(
+        adb: String,
+        dev: AdbDevice,
+        direction: AdbSyncDirection,
+        onStatus: (String) -> Unit,
+    ): Pair<Int, Int> {
+        val localDir = runCatching { DesktopPlaylistStore.ensureWritableDirectory() }.getOrNull() ?: return 0 to 0
+        executeCommand(adb, "-s", dev.serial, "shell", "mkdir -p ${shellQuote(ANDROID_PLAYLISTS_DIR)}")
+
+        val localJsonFiles = runCatching {
+            Files.list(localDir).use { stream ->
+                stream.filter {
+                    Files.isRegularFile(it) &&
+                        !it.fileName.toString().startsWith(".") &&
+                        it.extension.equals("json", ignoreCase = true)
+                }.toList()
+            }
+        }.getOrDefault(emptyList())
+
+        val androidOutput = executeCommand(adb, "-s", dev.serial, "shell", "ls -1 ${shellQuote(ANDROID_PLAYLISTS_DIR)}")
+        val androidFiles = androidOutput.lines().map(String::trim).filter {
+            it.isNotBlank() && !it.startsWith("ls:") && it.endsWith(".json", ignoreCase = true) && !it.startsWith(".")
+        }.toSet()
+
+        var pushed = 0
+        var pulled = 0
+
+        if (direction == AdbSyncDirection.PUSH_TO_MOBILE || direction == AdbSyncDirection.TWO_WAY_MERGE) {
+            for (file in localJsonFiles) {
+                val fileName = file.fileName.toString()
+                if (fileName !in androidFiles) {
+                    onStatus("Mengirim playlist: $fileName...")
+                    val pushResult = executeCommand(
+                        adb,
+                        "-s",
+                        dev.serial,
+                        "push",
+                        file.toAbsolutePath().toString(),
+                        "$ANDROID_PLAYLISTS_DIR/$fileName",
+                    )
+                    if (!pushResult.contains("error", ignoreCase = true) && !pushResult.contains("failed", ignoreCase = true)) {
+                        pushed++
+                    }
+                }
+            }
+        }
+
+        if (direction == AdbSyncDirection.PULL_FROM_MOBILE || direction == AdbSyncDirection.TWO_WAY_MERGE) {
+            val localNames = localJsonFiles.map { it.fileName.toString() }.toSet()
+            for (remoteName in androidFiles) {
+                if (remoteName !in localNames) {
+                    onStatus("Mengunduh playlist: $remoteName...")
+                    val target = localDir.resolve(remoteName).toAbsolutePath().toString()
+                    val pullResult = executeCommand(
+                        adb,
+                        "-s",
+                        dev.serial,
+                        "pull",
+                        "$ANDROID_PLAYLISTS_DIR/$remoteName",
+                        target,
+                    )
+                    if (!pullResult.contains("error", ignoreCase = true) && !pullResult.contains("failed", ignoreCase = true)) {
+                        pulled++
+                    }
+                }
+            }
+            if (pulled > 0) {
+                DesktopMobileSyncServer.onPlaylistsUpdated?.invoke()
+            }
+        }
+        return pushed to pulled
     }
 
     private fun executeCommand(vararg command: String): String {
@@ -349,18 +468,57 @@ object AdbSyncManager {
     private fun startMonitor() {
         monitorJob?.cancel()
         monitorJob = scope.launch {
-            var lastDeviceCount = 0
+            var lastReadySerials = emptySet<String>()
             while (isActive) {
                 delay(5000)
                 if (_isAdbAvailable.value) {
-                    val list = refreshDevicesNow()
-                    val currentCount = list.size
-                    if (currentCount > lastDeviceCount && _autoSyncOnConnect.value) {
+                    refreshDevicesNow()
+                    val readySerials = _connectedDevices.value.map { it.serial }.toSet()
+                    val newlyActivated = readySerials - lastReadySerials
+                    if (newlyActivated.isNotEmpty() &&
+                        DesktopMobileSyncServer.isEnabled.value &&
+                        DesktopMobileSyncServer.isRunning.value
+                    ) {
                         syncMusic(AdbSyncDirection.TWO_WAY_MERGE)
                     }
-                    lastDeviceCount = currentCount
+                    lastReadySerials = readySerials
                 }
             }
         }
+    }
+
+    internal fun isPidofOutputRunning(output: String): Boolean {
+        return output.trim()
+            .split(Regex("\\s+"))
+            .any { token -> token.isNotEmpty() && token.all(Char::isDigit) }
+    }
+
+    private fun isLuminaChordOpenOnDevice(adb: String, serial: String): Boolean {
+        val output = runShellCapture(adb, serial, "pidof com.music.bitchord || pidof com.dev.bitchord")
+            ?: return false
+        return isPidofOutputRunning(output)
+    }
+
+    private fun removeReverseForSerial(adb: String, serial: String, port: Int) {
+        runCatching {
+            val proc = ProcessBuilder(adb, "-s", serial, "reverse", "--remove", "tcp:$port")
+                .redirectErrorStream(true)
+                .start()
+            proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    private fun runShellCapture(adb: String, serial: String, shellCmd: String): String? {
+        return runCatching {
+            val proc = ProcessBuilder(adb, "-s", serial, "shell", shellCmd)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().use { it.readText() }
+            if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                proc.destroyForcibly()
+                return@runCatching null
+            }
+            out
+        }.getOrNull()
     }
 }

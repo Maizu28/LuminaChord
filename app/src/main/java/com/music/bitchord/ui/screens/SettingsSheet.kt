@@ -169,7 +169,10 @@ import com.music.bitchord.playback.smart.AutomixModels
 import com.music.bitchord.R
 import com.music.bitchord.data.sources.DeviceCodecs
 import com.music.bitchord.data.settings.AudioQuality
+import com.music.bitchord.data.settings.DownloadFormat
 import com.music.bitchord.data.settings.DownloadQuality
+import com.music.bitchord.download.DownloadStore
+import com.music.bitchord.download.Downloads
 import com.music.bitchord.data.settings.ThemeMode
 import com.music.bitchord.data.settings.AppFont
 import com.music.bitchord.data.settings.PlayerTheme
@@ -290,8 +293,8 @@ fun SettingsScreen(
     val cacheLimitBytes by AppSettings.audioCacheLimitBytes.collectAsStateWithLifecycle()
     val showCacheFolder by AppSettings.showCacheFolder.collectAsStateWithLifecycle()
     val downloadQuality by AppSettings.downloadQuality.collectAsStateWithLifecycle()
+    val downloadFormat by AppSettings.downloadFormat.collectAsStateWithLifecycle()
     val wifiOnlyDownloads by AppSettings.wifiOnlyDownloads.collectAsStateWithLifecycle()
-    val exportDownloads by AppSettings.exportDownloads.collectAsStateWithLifecycle()
     val syncDownloadedPlaylists by AppSettings.syncDownloadedPlaylists.collectAsStateWithLifecycle()
     val downloadLikedSongs by AppSettings.downloadLikedSongs.collectAsStateWithLifecycle()
     val stopOnTaskRemoved by AppSettings.stopOnTaskRemoved.collectAsStateWithLifecycle()
@@ -373,10 +376,11 @@ fun SettingsScreen(
         runCatching {
             context.contentResolver.takePersistableUriPermission(
                 folder,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
             )
         }
         AppSettings.setLocalMusicFolderUri(folder.toString())
+        backupScope.launch { Downloads.migrateLegacyDownloads(context) }
     }
 
     /**
@@ -633,6 +637,22 @@ fun SettingsScreen(
                     onClick = { onOpenChoice(SettingsChoiceKind.DOWNLOAD_QUALITY) },
                 )
             }
+            val downloadFormatTitle = stringResource(R.string.download_format)
+            row(downloadFormatTitle, "mp3", "webm", "format") {
+                SettingsRow(
+                    icon = SfIcons.Download,
+                    title = downloadFormatTitle,
+                    subtitle = stringResource(
+                        if (downloadFormat == DownloadFormat.MP3) {
+                            R.string.download_format_mp3_detail
+                        } else {
+                            R.string.download_format_webm_detail
+                        },
+                    ),
+                    value = downloadFormat.label,
+                    onClick = { onOpenChoice(SettingsChoiceKind.DOWNLOAD_FORMAT) },
+                )
+            }
             // Reads as part of Download quality above it, not as a setting
             // of its own — same treatment as Play animated cover over
             // cellular gets under Animated cover art.
@@ -645,13 +665,18 @@ fun SettingsScreen(
                     badge = stringResource(R.string.blocking).takeIf { wifiOnlyDownloads && metered == true },
                 )
             }
-            val exportDownloadsTitle = stringResource(R.string.export_compatible_downloads)
-            row(exportDownloadsTitle, "music folder") {
-                SettingsSubRow(
-                    title = exportDownloadsTitle,
-                    checked = exportDownloads,
-                    onCheckedChange = AppSettings::setExportDownloads,
-                    subtitle = "Music/LuminaChord".takeIf { exportDownloads },
+            val downloadFolderTitle = stringResource(R.string.download_folder)
+            val customFolderLabel = LocalMediaRepository.selectedFolderLabel(localMusicFolderUri)
+            row(downloadFolderTitle, "music folder", "lumina", "directory", "path") {
+                SettingsRow(
+                    icon = SfIcons.Folder,
+                    title = downloadFolderTitle,
+                    subtitle = if (customFolderLabel != null) {
+                        stringResource(R.string.download_folder_custom_subtitle, DownloadStore.folderDisplayLabel(context))
+                    } else {
+                        stringResource(R.string.download_folder_all_subtitle)
+                    },
+                    onClick = { localMusicFolderPicker.launch(null) },
                 )
             }
             val syncPlaylistsTitle = stringResource(R.string.sync_downloaded_playlists)
@@ -1524,12 +1549,16 @@ fun SettingsScreen(
 
         if (shows(SettingsCategory.LOCAL_MUSIC)) SearchableSettingsGroup(search, header = stringResource(R.string.local_music)) {
             val localMusicFolderTitle = stringResource(R.string.local_music_folder)
-            row(localMusicFolderTitle, "folder", "offline", "files") {
+            val selectedLabel = LocalMediaRepository.selectedFolderLabel(localMusicFolderUri)
+            row(localMusicFolderTitle, "folder", "offline", "files", "download") {
                 SettingsRow(
                     icon = SfIcons.Folder,
                     title = localMusicFolderTitle,
-                    subtitle = LocalMediaRepository.selectedFolderLabel(localMusicFolderUri)
-                        ?: stringResource(R.string.all_audio_folders),
+                    subtitle = if (selectedLabel != null) {
+                        stringResource(R.string.download_folder_custom_subtitle, DownloadStore.folderDisplayLabel(context))
+                    } else {
+                        "${stringResource(R.string.all_audio_folders)} · ${DownloadStore.DEFAULT_PUBLIC_PATH_LABEL}"
+                    },
                     onClick = { localMusicFolderPicker.launch(null) },
                 )
             }
@@ -1540,9 +1569,28 @@ fun SettingsScreen(
                         icon = SfIcons.LibraryMusic,
                         title = useAllAudioFoldersTitle,
                         subtitle = stringResource(R.string.use_all_audio_folders_subtitle),
-                        onClick = { AppSettings.setLocalMusicFolderUri("") },
+                        onClick = {
+                            AppSettings.setLocalMusicFolderUri("")
+                            backupScope.launch { Downloads.migrateLegacyDownloads(context) }
+                        },
                     )
                 }
+            }
+            val downloadFormatTitle = stringResource(R.string.download_format)
+            row(downloadFormatTitle, "mp3", "webm", "download", "format") {
+                SettingsRow(
+                    icon = SfIcons.Download,
+                    title = downloadFormatTitle,
+                    subtitle = stringResource(
+                        if (downloadFormat == DownloadFormat.MP3) {
+                            R.string.download_format_mp3_detail
+                        } else {
+                            R.string.download_format_webm_detail
+                        },
+                    ),
+                    value = downloadFormat.label,
+                    onClick = { onOpenChoice(SettingsChoiceKind.DOWNLOAD_FORMAT) },
+                )
             }
             val filterNonMusicAudioTitle = stringResource(R.string.filter_non_music_audio)
             row(filterNonMusicAudioTitle, "podcast", "recording") {
@@ -3099,6 +3147,7 @@ enum class SettingsChoiceKind(@param:StringRes val title: Int) {
     AUDIO_QUALITY_WIFI(R.string.on_wifi),
     AUDIO_QUALITY_CELLULAR(R.string.on_mobile_data),
     DOWNLOAD_QUALITY(R.string.download_quality),
+    DOWNLOAD_FORMAT(R.string.download_format),
     AUTOMIX_PERFORMANCE(R.string.automix_performance),
     BIT_PERFECT(R.string.bit_perfect_output),
     FONT(R.string.font),
@@ -3178,6 +3227,28 @@ fun SettingsChoicePage(
                     footer = stringResource(R.string.download_quality_dialog_subtitle),
                 ) { quality ->
                     AppSettings.setDownloadQuality(quality)
+                    onChosen()
+                }
+            }
+
+            SettingsChoiceKind.DOWNLOAD_FORMAT -> {
+                val selected by AppSettings.downloadFormat.collectAsStateWithLifecycle()
+                ChoiceGroup(
+                    options = DownloadFormat.entries,
+                    selected = selected,
+                    label = { it.label },
+                    detail = {
+                        stringResource(
+                            if (it == DownloadFormat.MP3) {
+                                R.string.download_format_mp3_detail
+                            } else {
+                                R.string.download_format_webm_detail
+                            },
+                        )
+                    },
+                    footer = stringResource(R.string.download_format_dialog_subtitle),
+                ) { format ->
+                    AppSettings.setDownloadFormat(format)
                     onChosen()
                 }
             }

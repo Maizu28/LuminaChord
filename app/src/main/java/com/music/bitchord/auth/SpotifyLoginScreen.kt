@@ -1,6 +1,7 @@
 package com.music.bitchord.auth
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.net.Uri
 import android.view.View
 import android.view.ViewGroup
@@ -9,15 +10,46 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.net.toUri
+import com.music.bitchord.R
 import com.music.bitchord.data.web.QuietWebChromeClient
 
 private const val LOGIN_URL =
@@ -31,7 +63,16 @@ private val SPOTIFY_COOKIE_URLS = listOf(
 )
 
 private val LOGIN_HOST_SUFFIXES = listOf(
-    "spotify.com", "scdn.co", "google.com", "gstatic.com", "facebook.com", "apple.com",
+    "spotify.com",
+    "spotifycdn.com",
+    "scdn.co",
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "recaptcha.net",
+    "hcaptcha.com",
+    "facebook.com",
+    "apple.com",
 )
 
 private fun hostMatches(uri: Uri?, suffixes: List<String>): Boolean {
@@ -41,6 +82,31 @@ private fun hostMatches(uri: Uri?, suffixes: List<String>): Boolean {
 }
 
 private fun isLoginHost(uri: Uri?) = hostMatches(uri, LOGIN_HOST_SUFFIXES)
+
+private fun extractSpDcCookie(): String? {
+    val manager = CookieManager.getInstance()
+    for (url in SPOTIFY_COOKIE_URLS) {
+        val raw = manager.getCookie(url) ?: continue
+        val token = raw.split(";")
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("sp_dc=") }
+            ?.substringAfter("=")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+        if (token != null) return token
+    }
+    return null
+}
+
+private fun sanitizeSpDcInput(raw: String): String {
+    val trimmed = raw.trim().trim('"').trim('\'')
+    val withoutPrefix = if (trimmed.startsWith("sp_dc=", ignoreCase = true)) {
+        trimmed.substringAfter("=")
+    } else {
+        trimmed
+    }
+    return withoutPrefix.substringBefore(";").trim()
+}
 
 /**
  * Signs the login WebView out of Spotify. Disconnecting only forgot the
@@ -66,14 +132,11 @@ fun clearSpotifyWebSession() {
 
 /**
  * In-app Spotify sign-in. Lets the real accounts.spotify.com page handle the
- * login, then hands the `sp_dc` cookie to [onConnected] once the page lands on
- * open.spotify.com.
+ * login, then hands the `sp_dc` cookie to [onConnected] once authenticated.
  *
- * Must be hosted as a root overlay, like [DiscordLoginScreen], never inside the
- * page content: that subtree is the `hazeSource` and the glass backdrop, both of
- * which record it into a layer and draw it a second time. A WebView drawn twice
- * flickers, drops parts of the page, and on some devices takes the app down in
- * Chromium's draw functor.
+ * Uses authentic WebView User-Agent matching Chromium Client Hints (`Sec-CH-UA`)
+ * so Spotify/reCAPTCHA do not reject mismatched headers, and provides a clean
+ * fallback to paste `sp_dc` directly when reCAPTCHA blocks embedded WebViews.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -81,65 +144,213 @@ fun SpotifyLoginScreen(
     onConnected: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     var webView by remember { mutableStateOf<WebView?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
+    var manualMode by remember { mutableStateOf(false) }
+    var spdcInput by remember { mutableStateOf("") }
+    var inputError by remember { mutableStateOf<String?>(null) }
 
-    AndroidView(
-        modifier = modifier.fillMaxSize(),
-        factory = { context ->
-            WebView(context).apply {
-                // MATCH_PARENT, not the WRAP_CONTENT Compose hands a bare view:
-                // see DiscordLoginScreen — a zero layout viewport collapses
-                // any page sized off `height: 100%`, and Spotify's is.
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                )
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                // The device's own mobile Chrome, minus the WebView markers. A
-                // desktop user agent served the desktop layout scaled into a
-                // phone, where part of the page fell off screen.
-                settings.userAgentString = browserUserAgent(settings.userAgentString)
-                setBackgroundColor(0xFF121212.toInt())
-                CookieManager.getInstance().setAcceptCookie(true)
-                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                webChromeClient = QuietWebChromeClient()
-                var sent = false
-                webViewClient = object : WebViewClient() {
-                    // Spotify's own pages and the identity providers its sign-in
-                    // hands off to; anything else is not part of logging in.
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView,
-                        request: WebResourceRequest,
-                    ): Boolean = !isLoginHost(request.url)
-
-                    override fun onPageFinished(view: WebView, url: String?) {
-                        canGoBack = view.canGoBack()
-                        if (sent || url?.startsWith("https://open.spotify.com") != true) return
-                        val raw = CookieManager.getInstance().getCookie("https://open.spotify.com") ?: return
-                        val token = raw.split(";")
-                            .map { it.trim() }
-                            .firstOrNull { it.startsWith("sp_dc=") }
-                            ?.substringAfter("=")
-                            ?.takeIf { it.isNotBlank() }
-                            ?: return
-                        sent = true
-                        // Hide before handing over, so the web player this
-                        // landed on doesn't flash up as the overlay tears down.
-                        view.visibility = View.GONE
-                        onConnected(token)
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFF121212)),
+    ) {
+        Surface(
+            color = Color(0xFF1A1A1A),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                TextButton(
+                    onClick = { manualMode = !manualMode },
+                ) {
+                    Text(
+                        text = if (manualMode) "Kembali ke Web Login" else "Gunakan Cookie sp_dc",
+                        color = Color(0xFF1ED760),
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                if (!manualMode) {
+                    TextButton(
+                        onClick = {
+                            clearSpotifyWebSession()
+                            webView?.loadUrl(LOGIN_URL)
+                        },
+                    ) {
+                        Icon(
+                            Icons.Rounded.Refresh,
+                            contentDescription = "Muat ulang sesi",
+                            tint = Color.White.copy(alpha = 0.85f),
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.size(4.dp))
+                        Text("Reset & Muat Ulang", color = Color.White.copy(alpha = 0.85f))
                     }
                 }
-                webView = this
-                loadUrl(LOGIN_URL)
             }
-        },
-        onRelease = { it.destroy() },
-    )
+        }
 
-    BackHandler(enabled = canGoBack) {
+        if (manualMode) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text(
+                    text = "Login Spotify via Cookie sp_dc",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = "Jika halaman login Spotify menampilkan \"Oops! Something went wrong\" akibat proteksi reCAPTCHA pada WebView, Anda dapat masuk melalui browser (Chrome/PC) lalu menempelkan nilai cookie `sp_dc` dari `open.spotify.com`:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White.copy(alpha = 0.78f),
+                )
+                Text(
+                    text = "1. Buka open.spotify.com di browser dan login seperti biasa (Email, Google, Facebook, atau Apple).\n" +
+                        "2. Buka Developer Tools (F12 / Ctrl+Shift+I) → Application → Cookies → https://open.spotify.com.\n" +
+                        "3. Salin nilai cookie bernama `sp_dc` lalu tempel di bawah.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White.copy(alpha = 0.68f),
+                )
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(LOGIN_URL)),
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("Buka Spotify Login di Browser HP", color = Color.White)
+                }
+                OutlinedTextField(
+                    value = spdcInput,
+                    onValueChange = {
+                        spdcInput = it
+                        inputError = null
+                    },
+                    label = { Text(stringResource(R.string.spdc_token)) },
+                    placeholder = { Text("Tempel nilai cookie sp_dc (atau sp_dc=...) di sini") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF1ED760),
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.3f),
+                        focusedLabelColor = Color(0xFF1ED760),
+                        unfocusedLabelColor = Color.White.copy(alpha = 0.65f),
+                    ),
+                )
+                inputError?.let { err ->
+                    Text(
+                        text = err,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFFF6B6B),
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Button(
+                    onClick = {
+                        val cleaned = sanitizeSpDcInput(spdcInput)
+                        if (cleaned.length < 16) {
+                            inputError = "Cookie sp_dc tidak valid atau terlalu pendek."
+                        } else {
+                            onConnected(cleaned)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF1ED760),
+                        contentColor = Color.Black,
+                    ),
+                ) {
+                    Text(
+                        text = stringResource(R.string.save),
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        } else {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            )
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.databaseEnabled = true
+                            settings.javaScriptCanOpenWindowsAutomatically = true
+                            setBackgroundColor(0xFF121212.toInt())
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                            webChromeClient = QuietWebChromeClient()
+                            var sent = false
+                            fun checkAndComplete(view: WebView, currentUrl: String?) {
+                                canGoBack = view.canGoBack()
+                                if (sent) return
+                                val landedOnOpenSpotify = currentUrl?.startsWith("https://open.spotify.com") == true
+                                val onStatusPage = currentUrl?.startsWith("https://accounts.spotify.com") == true &&
+                                    currentUrl.contains("/status")
+                                if (!landedOnOpenSpotify && !onStatusPage) return
+                                val token = extractSpDcCookie() ?: return
+                                sent = true
+                                CookieManager.getInstance().flush()
+                                view.visibility = View.GONE
+                                onConnected(token)
+                            }
+
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView,
+                                    request: WebResourceRequest,
+                                ): Boolean {
+                                    if (!request.isForMainFrame) return false
+                                    return !isLoginHost(request.url)
+                                }
+
+                                override fun onPageFinished(view: WebView, url: String?) {
+                                    checkAndComplete(view, url)
+                                }
+
+                                override fun doUpdateVisitedHistory(
+                                    view: WebView,
+                                    url: String?,
+                                    isReload: Boolean,
+                                ) {
+                                    checkAndComplete(view, url)
+                                }
+                            }
+                            webView = this
+                            loadUrl(LOGIN_URL)
+                        }
+                    },
+                    onRelease = { it.destroy() },
+                )
+            }
+        }
+    }
+
+    BackHandler(enabled = !manualMode && canGoBack) {
         webView?.goBack()
     }
 }

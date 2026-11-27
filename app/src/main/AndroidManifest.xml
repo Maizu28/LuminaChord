@@ -58,13 +58,16 @@
         android:maxSdkVersion="32" />
 
     <!--
-      Only for API 28 and below. From 29 the app writes to the shared Music
-      folder through MediaStore, which grants access to the rows it created and
-      needs no permission at all — and this one stops being grantable there.
+      Legacy file access on API 26-29, and All Files Access on API 30+ so
+      downloads can live outside app data in /storage/emulated/0/LuminaChord/Music
+      and survive app reinstalls.
     -->
     <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
+        android:maxSdkVersion="29" />
     <!--
       Never requested: the manifest merger adds it on behalf of any library whose
       manifest declares no minSdk (it reads that as targetSdk < 4). The watch
@@ -78,6 +81,7 @@
         android:name=".BitChordApplication"
         android:allowBackup="true"
         android:appCategory="audio"
+        android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"

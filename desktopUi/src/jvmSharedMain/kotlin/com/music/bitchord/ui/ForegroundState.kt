@@ -11,40 +11,29 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 
 /**
- * Whether the app is actually on screen.
+ * Whether the desktop window is currently visible on screen (even when another window has focus).
  *
- * The distinction this exists to draw is one Compose does not draw on its own:
- * a `LaunchedEffect` belongs to the *composition*, not to the lifecycle, and a
- * composition outlives the activity being stopped — it is torn down only when
- * the activity is destroyed. So every loop the UI starts goes on running with
- * the screen off: position polls, frame clocks, a video decoder feeding a
- * surface nobody is looking at.
- *
- * None of that work has a viewer, and none of it survives being skipped —
- * whatever it was keeping up to date is re-read the moment the screen comes
- * back. Gating on this is the difference between "cheap while visible" and
- * "cheap", and it costs nothing on screen.
- *
- * RESUMED rather than STARTED: a paused-but-visible activity is one behind a
- * dialog or in the background half of split screen, which is not a case worth
- * animating for either.
- *
- * Playback itself is not gated on this and must not be — audio comes from
- * [com.music.bitchord.playback.PlaybackService], which is a foreground service
- * precisely so that it goes on running when this does not.
+ * On Compose Multiplatform Desktop, losing window focus (e.g. clicking another app or moving
+ * the cursor away) transitions the window's lifecycle from RESUMED to STARTED while keeping it
+ * visible. Only minimizing or hiding the window to tray drops below STARTED (CREATED/DESTROYED),
+ * so gating on STARTED keeps synced lyrics advancing when unfocused while still pausing
+ * off-screen animations when minimized or closed to tray.
  */
+internal fun isDesktopForegroundLifecycle(state: Lifecycle.State): Boolean =
+    state.isAtLeast(Lifecycle.State.STARTED)
+
 @Composable
 fun rememberIsForeground(): Boolean {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var foreground by remember(lifecycle) {
-        mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        mutableStateOf(isDesktopForegroundLifecycle(lifecycle.currentState))
     }
     DisposableEffect(lifecycle) {
-        // Every event rather than ON_RESUME/ON_PAUSE alone: the state is read
+        // Every event rather than ON_START/ON_STOP alone: the state is read
         // back off the lifecycle instead of inferred from which event arrived,
         // so there is no transition this can be left out of step by.
         val observer = LifecycleEventObserver { owner, _ ->
-            foreground = owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            foreground = isDesktopForegroundLifecycle(owner.lifecycle.currentState)
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }

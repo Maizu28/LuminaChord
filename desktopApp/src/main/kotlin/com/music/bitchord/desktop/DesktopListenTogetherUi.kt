@@ -251,7 +251,7 @@ private fun PartyLanding(
                             onValueChange = onNicknameChange,
                             label = { Text("Nickname") },
                             singleLine = true,
-                            modifier = Modifier.weight(1f).onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+                            modifier = Modifier.weight(1f).trackDesktopTypingFocus(),
                         )
                     }
                     Spacer(Modifier.height(16.dp))
@@ -280,7 +280,7 @@ private fun PartyLanding(
                         placeholder = { Text("ABC123") },
                         singleLine = true,
                         textStyle = MaterialTheme.typography.headlineSmall.copy(letterSpacing = 5.sp),
-                        modifier = Modifier.fillMaxWidth().onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+                        modifier = Modifier.fillMaxWidth().trackDesktopTypingFocus(),
                     )
                     Spacer(Modifier.height(18.dp))
                     PrimaryButton(
@@ -403,7 +403,7 @@ private fun JoinConfirmation(
             onValueChange = onNicknameChange,
             label = { Text("Nickname") },
             singleLine = true,
-            modifier = Modifier.width(360.dp).onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+            modifier = Modifier.width(360.dp).trackDesktopTypingFocus(),
         )
         error?.let { Spacer(Modifier.height(10.dp)); Text(it, color = DesktopDestructive) }
         Spacer(Modifier.height(20.dp))

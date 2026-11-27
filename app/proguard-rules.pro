@@ -82,6 +82,7 @@
 -dontwarn java.lang.management.**
 -dontwarn javax.el.**
 -dontwarn javax.script.**
+-dontwarn javax.sound.sampled.**
 -dontwarn jdk.dynalink.**
 -dontwarn org.ietf.jgss.**
 

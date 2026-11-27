@@ -13,9 +13,12 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.compose.runtime.snapshots.Snapshot
+import com.music.bitchord.R
 import com.music.bitchord.data.LikeState
 import com.music.bitchord.data.LocalMediaRepository
+import com.music.bitchord.data.OfflinePlaylist
 import com.music.bitchord.data.OfflinePlaylists
+import com.music.bitchord.data.PlaylistStorage
 import com.music.bitchord.data.lyrics.LyricAlignment
 import com.music.bitchord.data.lyrics.LyricLine
 import com.music.bitchord.data.lyrics.LyricSyllable
@@ -26,6 +29,12 @@ import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.spotify.LocalPlaylist
 import com.music.bitchord.data.spotify.LocalPlaylistStore
 import com.music.bitchord.playback.PlaybackPosition
+import com.music.bitchord.widget.LyricCueResolver
+import com.music.bitchord.widget.LyricWidget
+import com.music.bitchord.widget.LyricWidgetState
+import com.music.bitchord.widget.MediaWidget
+import com.music.bitchord.widget.MediaWidgetPill
+import com.music.bitchord.widget.MediaWidgetSnapshot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -116,6 +125,14 @@ data class DesktopLyricsState(
     val lines: List<LyricLine> = emptyList(),
 )
 
+data class MobileLyricsSnapshot(
+    val videoId: String = "",
+    val source: String? = null,
+    val loading: Boolean = false,
+    val unavailable: Boolean = false,
+    val lines: List<LyricLine> = emptyList(),
+)
+
 data class MobilePlaybackSnapshot(
     val song: Song?,
     val isPlaying: Boolean,
@@ -131,6 +148,8 @@ data class MobilePlaybackSnapshot(
 interface MobilePlaybackBridge {
     suspend fun currentPlaybackSnapshot(): MobilePlaybackSnapshot?
     fun pauseLocalPlayback()
+    fun playFromDesktop(songs: List<Song>, startIndex: Int, isOneOff: Boolean, isPlaying: Boolean = true)
+    fun enqueueFromDesktop(song: Song, playNext: Boolean)
     fun applyHandoffFromDesktop(
         songs: List<Song>,
         startIndex: Int,
@@ -143,6 +162,11 @@ interface MobilePlaybackBridge {
         action: String,
         value: String? = null,
         positionMs: Long? = null,
+        index: Int? = null,
+        from: Int? = null,
+        to: Int? = null,
+        shuffle: Boolean? = null,
+        repeatMode: Int? = null,
     )
 }
 
@@ -213,6 +237,18 @@ object DesktopSyncManager {
     var mobileBridge: MobilePlaybackBridge? = null
 
     @Volatile
+    private var mobileLyrics: MobileLyricsSnapshot? = null
+
+    @Volatile
+    private var mobileLyricsVersion: Long = 0L
+
+    @Volatile
+    private var lastSentMobileLyricsVersion: Long = -1L
+
+    @Volatile
+    private var lastSentMobileLyricsVideoId: String? = null
+
+    @Volatile
     private var lastSeekSentElapsedMs: Long = 0L
 
     @Volatile
@@ -224,8 +260,29 @@ object DesktopSyncManager {
     @Volatile
     private var lastAckedCommandId: Long = 0L
 
+    @Volatile
+    private var lastWidgetSnapshotKey: String? = null
+
+    @Volatile
+    private var lastOutputSwitchElapsedMs: Long = 0L
+
+    @Volatile
+    private var needsInitialOutputSync: Boolean = false
+
+    @Volatile
+    private var lastKnownMobilePlaying: Boolean = false
+
     private val _desktopLocalMusicCount = MutableStateFlow<Int?>(null)
     val desktopLocalMusicCount: StateFlow<Int?> = _desktopLocalMusicCount.asStateFlow()
+
+    private val _syncEnabled = MutableStateFlow(true)
+    val syncEnabled: StateFlow<Boolean> = _syncEnabled.asStateFlow()
+
+    @Volatile
+    private var autoPairMonitorJob: Job? = null
+
+    @Volatile
+    private var networkCallbackRegistered = false
 
     fun init(context: Context) {
         val ctx = context.applicationContext
@@ -233,6 +290,7 @@ object DesktopSyncManager {
         if (prefs != null) return
         val p = ctx.getSharedPreferences("luminachord_desktop_sync", Context.MODE_PRIVATE)
         prefs = p
+        _syncEnabled.value = p.getBoolean("sync_enabled", true)
         _hostIp.value = p.getString("host_ip", "192.168.1.100") ?: "192.168.1.100"
         _port.value = p.getInt("port", 8688)
         _pairingCode.value = p.getString("pairing_code", "") ?: ""
@@ -244,19 +302,154 @@ object DesktopSyncManager {
         val last = p.getLong("last_synced_time", -1L)
         _lastSyncedTime.value = if (last > 0) last else null
 
+        registerWifiAutoPairCallback(ctx)
+
         val wasConnected = p.getBoolean("is_connected", false)
-        if (wasConnected) {
-            val savedIp = _hostIp.value
-            val savedPort = _port.value
-            val savedCode = _pairingCode.value
-            scope.launch {
-                val alive = probeLuminaDesktop(savedIp, savedPort, 1800)
-                if (alive != null) {
-                    pairOverHttp(savedIp, savedPort, savedCode)
-                } else if (_autoDiscover.value) {
-                    autoDiscoverInternal(autoTriggered = true)
-                } else {
-                    _status.value = DesktopSyncStatus.Disconnected
+        if (_syncEnabled.value) {
+            if (wasConnected) {
+                val savedIp = _hostIp.value
+                val savedPort = _port.value
+                val savedCode = _pairingCode.value
+                scope.launch {
+                    val alive = probeLuminaDesktop(savedIp, savedPort, 1800)
+                    if (alive != null) {
+                        pairOverHttp(savedIp, savedPort, savedCode, silentAuto = true)
+                    } else {
+                        autoDiscoverInternal(autoTriggered = true)
+                    }
+                }
+            } else {
+                scope.launch { autoDiscoverInternal(autoTriggered = true) }
+            }
+            startAutoPairMonitor()
+        }
+    }
+
+    fun setSyncEnabled(enabled: Boolean) {
+        _syncEnabled.value = enabled
+        prefs?.edit()?.putBoolean("sync_enabled", enabled)?.apply()
+        if (!enabled) {
+            autoPairMonitorJob?.cancel()
+            autoPairMonitorJob = null
+            disconnect()
+            _syncMessage.value = "LuminaChord Sync dinonaktifkan"
+        } else {
+            _syncMessage.value = null
+            startAutoPairMonitor()
+            scope.launch { autoDiscoverInternal(autoTriggered = true) }
+        }
+    }
+
+    private fun registerWifiAutoPairCallback(ctx: Context) {
+        if (networkCallbackRegistered) return
+        runCatching {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                ?: return
+            val request = android.net.NetworkRequest.Builder()
+                .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            cm.registerNetworkCallback(
+                request,
+                object : android.net.ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: android.net.Network) {
+                        if (_syncEnabled.value &&
+                            _autoDiscover.value &&
+                            _status.value is DesktopSyncStatus.Disconnected
+                        ) {
+                            scope.launch { autoDiscoverInternal(autoTriggered = true) }
+                        }
+                    }
+
+                    override fun onLinkPropertiesChanged(
+                        network: android.net.Network,
+                        linkProperties: android.net.LinkProperties,
+                    ) {
+                        if (_syncEnabled.value &&
+                            _autoDiscover.value &&
+                            _status.value is DesktopSyncStatus.Disconnected
+                        ) {
+                            scope.launch { autoDiscoverInternal(autoTriggered = true) }
+                        }
+                    }
+                },
+            )
+            networkCallbackRegistered = true
+        }
+    }
+
+    private fun startAutoPairMonitor() {
+        if (autoPairMonitorJob?.isActive == true) return
+        autoPairMonitorJob = scope.launch {
+            var tick = 0
+            while (isActive && _syncEnabled.value) {
+                delay(4000)
+                if (!_syncEnabled.value) break
+                if (_status.value !is DesktopSyncStatus.Disconnected) continue
+                try {
+                    val port = _port.value
+                    // Silent backend USB loopback probe while LuminaChord is running on both devices
+                    val usbStatus = probeLuminaDesktop("127.0.0.1", port, 350)
+                    if (usbStatus != null && _syncEnabled.value && _status.value is DesktopSyncStatus.Disconnected) {
+                        pairOverHttp("127.0.0.1", port, _pairingCode.value, silentAuto = true)
+                        continue
+                    }
+
+                    // Automatic Wi-Fi pairing when enabled and on the same Wi-Fi network
+                    if (_autoDiscover.value && isOnWifiNetwork()) {
+                        val includeSubnetSweep = (tick % 6 == 0)
+                        autoDiscoverWifiSilent(includeSubnetSweep = includeSubnetSweep)
+                    }
+                } catch (_: Exception) {
+                }
+                tick++
+            }
+        }
+    }
+
+    private fun isOnWifiNetwork(): Boolean {
+        val ctx = appContext ?: return true
+        return runCatching {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                ?: return@runCatching true
+            val active = cm.activeNetwork ?: return@runCatching false
+            val caps = cm.getNetworkCapabilities(active) ?: return@runCatching false
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+        }.getOrDefault(true)
+    }
+
+    private suspend fun autoDiscoverWifiSilent(includeSubnetSweep: Boolean) {
+        if (!_syncEnabled.value || !_autoDiscover.value) return
+        if (_status.value !is DesktopSyncStatus.Disconnected) return
+
+        val port = _port.value
+        val beacon = discoverFromUdpBeacon(port, timeoutMs = 2200)
+        if (beacon != null && _syncEnabled.value && _status.value is DesktopSyncStatus.Disconnected) {
+            if (beacon.code.isNotBlank() || !beacon.requirePin) {
+                pairOverHttp(beacon.ip, beacon.port, beacon.code, silentAuto = true)
+                return
+            }
+        }
+
+        val savedIp = _hostIp.value
+        if (savedIp.isNotBlank() && savedIp != "127.0.0.1") {
+            val aliveSaved = probeLuminaDesktop(savedIp, port, 700)
+            if (aliveSaved != null && _syncEnabled.value && _status.value is DesktopSyncStatus.Disconnected) {
+                val reqPin = aliveSaved.optBoolean("requirePairingCode", true)
+                val codeToUse = if (!reqPin || _pairingCode.value.isNotBlank()) _pairingCode.value else ""
+                if (!reqPin || codeToUse.isNotBlank()) {
+                    pairOverHttp(savedIp, port, codeToUse, silentAuto = true)
+                    return
+                }
+            }
+        }
+
+        if (includeSubnetSweep) {
+            val found = sweepLocalSubnets(port)
+            if (found != null && _syncEnabled.value && _status.value is DesktopSyncStatus.Disconnected) {
+                val (foundIp, infoJson) = found
+                val reqPin = infoJson.optBoolean("requirePairingCode", true)
+                if (!reqPin || (_pairingCode.value.isNotBlank() && foundIp == _hostIp.value)) {
+                    pairOverHttp(foundIp, port, if (reqPin) _pairingCode.value else "", silentAuto = true)
                 }
             }
         }
@@ -282,6 +475,9 @@ object DesktopSyncManager {
     fun setAutoDiscover(enabled: Boolean) {
         _autoDiscover.value = enabled
         prefs?.edit()?.putBoolean("auto_discover", enabled)?.apply()
+        if (enabled && _syncEnabled.value && _status.value is DesktopSyncStatus.Disconnected) {
+            scope.launch { autoDiscoverInternal(autoTriggered = true) }
+        }
     }
 
     fun setSyncPlaylists(enabled: Boolean) {
@@ -352,7 +548,11 @@ object DesktopSyncManager {
         jobs.awaitAll().firstOrNull { it != null }
     }
 
-    private fun pairOverHttp(ip: String, port: Int, code: String) {
+    private fun pairOverHttp(ip: String, port: Int, code: String, silentAuto: Boolean = false) {
+        if (!_syncEnabled.value) {
+            _status.value = DesktopSyncStatus.Disconnected
+            return
+        }
         try {
             val url = URL("http://$ip:$port/api/pair")
             val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -367,6 +567,9 @@ object DesktopSyncManager {
             val payloadObj = JSONObject()
                 .put("device", myDevice)
                 .put("code", code)
+            if (ip == "127.0.0.1") {
+                payloadObj.put("transport", "usb")
+            }
             OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8).use { it.write(payloadObj.toString()) }
 
             val responseCode = conn.responseCode
@@ -380,38 +583,49 @@ object DesktopSyncManager {
                 setPort(port)
                 setPairingCode(code)
 
+                needsInitialOutputSync = true
+                lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
                 _status.value = DesktopSyncStatus.Connected(deviceName, ip, port)
                 prefs?.edit()
                     ?.putBoolean("is_connected", true)
                     ?.putString("device_name", deviceName)
                     ?.apply()
-                val viaUsb = if (ip == "127.0.0.1") " via USB ADB" else ""
-                _syncMessage.value = "Berhasil terhubung dengan $deviceName$viaUsb ($ip:$port)!"
+                _syncMessage.value = "Berhasil terhubung dengan $deviceName!"
                 startPolling(ip, port)
                 fetchStatusOnce(ip, port)
                 fetchDesktopLocalMusic()
             } else if (responseCode == 403) {
                 _status.value = DesktopSyncStatus.Disconnected
                 prefs?.edit()?.putBoolean("is_connected", false)?.apply()
-                _syncMessage.value = "Kode pairing (PIN) salah! Periksa PIN di LuminaChord Windows PC."
+                if (!silentAuto) {
+                    _syncMessage.value = "Kode pairing (PIN) salah! Periksa PIN di LuminaChord Windows PC."
+                }
             } else {
                 _status.value = DesktopSyncStatus.Disconnected
                 prefs?.edit()?.putBoolean("is_connected", false)?.apply()
-                _syncMessage.value = "Server desktop merespons dengan kode error: HTTP $responseCode"
+                if (!silentAuto) {
+                    _syncMessage.value = "Server desktop merespons dengan kode error: HTTP $responseCode"
+                }
             }
         } catch (e: ConnectException) {
             _status.value = DesktopSyncStatus.Disconnected
             prefs?.edit()?.putBoolean("is_connected", false)?.apply()
-            _syncMessage.value = "Koneksi ditolak di $ip:$port. Pastikan server LuminaChord Sync di Windows aktif dan Firewall tidak memblokir port $port."
+            if (!silentAuto) {
+                _syncMessage.value = "Koneksi ditolak di $ip:$port. Pastikan server LuminaChord Sync di Windows aktif dan Firewall tidak memblokir port $port."
+            }
         } catch (e: SocketTimeoutException) {
             _status.value = DesktopSyncStatus.Disconnected
             prefs?.edit()?.putBoolean("is_connected", false)?.apply()
-            _syncMessage.value = "Timeout menghubungi $ip:$port. Pastikan PC & HP di Wi-Fi yang sama (atau colok kabel USB + ADB Reverse) & aktifkan izin Firewall di Windows."
+            if (!silentAuto) {
+                _syncMessage.value = "Timeout menghubungi $ip:$port. Pastikan PC & HP di Wi-Fi yang sama & aktifkan izin Firewall di Windows."
+            }
         } catch (e: Exception) {
             _status.value = DesktopSyncStatus.Disconnected
             prefs?.edit()?.putBoolean("is_connected", false)?.apply()
             val detail = "${e.javaClass.simpleName}: ${e.message ?: "Error tidak diketahui"}"
-            _syncMessage.value = "Gagal terhubung ke $ip:$port ($detail)"
+            if (!silentAuto) {
+                _syncMessage.value = "Gagal terhubung ke $ip:$port ($detail)"
+            }
         }
     }
 
@@ -765,6 +979,8 @@ object DesktopSyncManager {
         lastReportedTrackKey = null
         lastReportedPlaying = false
         lastAckedCommandId = 0L
+        lastSentMobileLyricsVersion = -1L
+        lastSentMobileLyricsVideoId = null
         desktopPosition.report(0L, isPlaying = false)
         _status.value = DesktopSyncStatus.Disconnected
         prefs?.edit()?.putBoolean("is_connected", false)?.apply()
@@ -773,6 +989,7 @@ object DesktopSyncManager {
 
     fun setDesktopOutputActive(active: Boolean) {
         val connected = _status.value is DesktopSyncStatus.Connected
+        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
         _desktopOutputActive.value = active && connected
         if (_desktopOutputActive.value) {
             val status = _status.value as? DesktopSyncStatus.Connected ?: return
@@ -786,6 +1003,7 @@ object DesktopSyncManager {
      */
     fun switchOutputToDesktop(handoffIfMobilePlaying: Boolean = true) {
         val currentStatus = _status.value as? DesktopSyncStatus.Connected ?: return
+        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
         scope.launch {
             val bridge = mobileBridge
             val mobileSnap = bridge?.currentPlaybackSnapshot()
@@ -802,6 +1020,7 @@ object DesktopSyncManager {
                 val wasPlaying = mobileSnap.isPlaying
                 val posMs = mobileSnap.positionMs.coerceAtLeast(0L)
                 _desktopOutputActive.value = true
+                lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
                 Snapshot.withMutableSnapshot {
                     desktopPosition.seeks++
                 }
@@ -820,6 +1039,7 @@ object DesktopSyncManager {
                 fetchStatusOnce(currentStatus.host, currentStatus.port)
             } else {
                 _desktopOutputActive.value = true
+                lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
                 postRemotePayload(
                     currentStatus.host,
                     currentStatus.port,
@@ -834,6 +1054,7 @@ object DesktopSyncManager {
     fun switchOutputToMobile(handoffFromDesktop: Boolean = true) {
         val currentStatus = _status.value as? DesktopSyncStatus.Connected
         val bridge = mobileBridge
+        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
         _desktopOutputActive.value = false
         if (currentStatus == null) return
 
@@ -883,10 +1104,98 @@ object DesktopSyncManager {
         }
     }
 
+    private data class UdpBeaconMatch(
+        val ip: String,
+        val port: Int,
+        val code: String,
+        val deviceName: String,
+        val requirePin: Boolean,
+    )
+
     @SuppressLint("WifiManagerLeak")
+    private suspend fun discoverFromUdpBeacon(listenPort: Int, timeoutMs: Int): UdpBeaconMatch? {
+        val wifiMgr = appContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val lock = runCatching {
+            wifiMgr?.createMulticastLock("LuminaChordSyncLock")?.apply {
+                setReferenceCounted(true)
+                acquire()
+            }
+        }.getOrNull()
+        var socket: DatagramSocket? = null
+        return try {
+            socket = DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(listenPort))
+                soTimeout = timeoutMs
+            }
+            val buffer = ByteArray(4096)
+            val packet = DatagramPacket(buffer, buffer.size)
+            socket.receive(packet)
+            val text = String(packet.data, 0, packet.length, StandardCharsets.UTF_8)
+            if (!text.startsWith("LUMINACHORD_DESKTOP_BEACON|")) return null
+
+            val jsonText = text.substringAfter("LUMINACHORD_DESKTOP_BEACON|")
+            val obj = JSONObject(jsonText)
+            val primary = obj.optString("ip", "")
+            val ipsArr = obj.optJSONArray("ips")
+            val candidates = mutableListOf<String>()
+            if (primary.isNotBlank()) candidates.add(primary)
+            if (ipsArr != null) {
+                for (i in 0 until ipsArr.length()) {
+                    val s = ipsArr.optString(i, "")
+                    if (s.isNotBlank()) candidates.add(s)
+                }
+            }
+            val senderIp = packet.address?.hostAddress
+            if (!senderIp.isNullOrBlank()) candidates.add(senderIp)
+
+            val discoveredPort = obj.optInt("port", listenPort)
+            val discoveredCode = obj.optString("code", _pairingCode.value)
+            val discoveredName = obj.optString("deviceName", "LuminaChord Desktop (Windows)")
+            val requiresPin = obj.optBoolean("requirePairingCode", false)
+
+            val reachable = probeBestCandidate(candidates.distinct(), discoveredPort) ?: candidates.firstOrNull()
+            if (reachable.isNullOrBlank()) {
+                null
+            } else {
+                UdpBeaconMatch(
+                    ip = reachable,
+                    port = discoveredPort,
+                    code = discoveredCode,
+                    deviceName = discoveredName,
+                    requirePin = requiresPin,
+                )
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { socket?.close() }
+            runCatching { if (lock?.isHeld == true) lock.release() }
+        }
+    }
+
     private suspend fun autoDiscoverInternal(autoTriggered: Boolean) {
-        _status.value = DesktopSyncStatus.Searching
-        _syncMessage.value = "Mencari LuminaChord Desktop (Wi-Fi LAN & USB ADB)..."
+        if (!_syncEnabled.value) {
+            _status.value = DesktopSyncStatus.Disconnected
+            return
+        }
+        if (!autoTriggered) {
+            _status.value = DesktopSyncStatus.Searching
+            _syncMessage.value = "Mencari LuminaChord Desktop di Wi-Fi lokal..."
+        }
+
+        // Silent backend USB loopback check (only succeeds when Desktop & Android LuminaChord are both open)
+        val usbAlive = probeLuminaDesktop("127.0.0.1", _port.value, 350)
+        if (usbAlive != null) {
+            val usbName = usbAlive.optString("deviceName", "LuminaChord Desktop (Windows)")
+            if (!autoTriggered) {
+                _syncMessage.value = "Ditemukan $usbName! Menghubungkan..."
+            }
+            pairOverHttp("127.0.0.1", _port.value, _pairingCode.value, silentAuto = autoTriggered)
+            return
+        }
+
+        if (autoTriggered && !_autoDiscover.value) return
 
         var discoveredIp: String? = null
         var discoveredPort = _port.value
@@ -894,57 +1203,21 @@ object DesktopSyncManager {
         var discoveredName: String? = null
         var requiresPin = false
 
-        // 1. Listen for UDP Broadcast Beacon with MulticastLock & SO_REUSEADDR
-        val wifiMgr = appContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        val lock = runCatching { wifiMgr?.createMulticastLock("LuminaChordSyncLock")?.apply { setReferenceCounted(true); acquire() } }.getOrNull()
-        var socket: DatagramSocket? = null
-        try {
-            socket = DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(InetSocketAddress(8688))
-                soTimeout = 2400
-            }
-            val buffer = ByteArray(4096)
-            val packet = DatagramPacket(buffer, buffer.size)
-            socket.receive(packet)
-            val text = String(packet.data, 0, packet.length, StandardCharsets.UTF_8)
-            if (text.startsWith("LUMINACHORD_DESKTOP_BEACON|")) {
-                val jsonText = text.substringAfter("LUMINACHORD_DESKTOP_BEACON|")
-                val obj = JSONObject(jsonText)
-                val primary = obj.optString("ip", "")
-                val ipsArr = obj.optJSONArray("ips")
-                val candidates = mutableListOf<String>()
-                if (primary.isNotBlank()) candidates.add(primary)
-                if (ipsArr != null) {
-                    for (i in 0 until ipsArr.length()) {
-                        val s = ipsArr.optString(i, "")
-                        if (s.isNotBlank()) candidates.add(s)
-                    }
-                }
-                val senderIp = packet.address?.hostAddress
-                if (!senderIp.isNullOrBlank()) candidates.add(senderIp)
-
-                discoveredPort = obj.optInt("port", 8688)
-                discoveredCode = obj.optString("code", _pairingCode.value)
-                discoveredName = obj.optString("deviceName", "LuminaChord Desktop (Windows)")
-                requiresPin = obj.optBoolean("requirePairingCode", false)
-
-                val reachable = probeBestCandidate(candidates.distinct(), discoveredPort) ?: candidates.firstOrNull()
-                if (!reachable.isNullOrBlank()) {
-                    discoveredIp = reachable
-                }
-            }
-        } catch (_: Exception) {
-        } finally {
-            runCatching { socket?.close() }
-            runCatching { if (lock?.isHeld == true) lock.release() }
+        // 1. Listen for UDP Broadcast Beacon on local Wi-Fi
+        val beacon = discoverFromUdpBeacon(_port.value, timeoutMs = 2400)
+        if (beacon != null) {
+            discoveredIp = beacon.ip
+            discoveredPort = beacon.port
+            discoveredCode = beacon.code
+            discoveredName = beacon.deviceName
+            requiresPin = beacon.requirePin
         }
 
-        // 2. Priority direct probe: ADB USB loopback (127.0.0.1), saved IP, and Emulator host (10.0.2.2)
+        // 2. Priority direct probe: saved LAN IP and Emulator host (10.0.2.2)
         if (discoveredIp == null) {
-            val priorityTargets = listOf("127.0.0.1", _hostIp.value, "10.0.2.2")
+            val priorityTargets = listOf(_hostIp.value, "10.0.2.2")
                 .map { it.trim() }
-                .filter { it.isNotBlank() }
+                .filter { it.isNotBlank() && it != "127.0.0.1" }
                 .distinct()
 
             for (ip in priorityTargets) {
@@ -978,16 +1251,20 @@ object DesktopSyncManager {
             }
 
             if (discoveredCode.isNotBlank() || !requiresPin) {
-                _syncMessage.value = "Ditemukan ${discoveredName ?: "Desktop"} di $discoveredIp:$discoveredPort! Menghubungkan..."
-                pairOverHttp(discoveredIp, discoveredPort, discoveredCode)
+                if (!autoTriggered) {
+                    _syncMessage.value = "Ditemukan ${discoveredName ?: "Desktop"} di $discoveredIp:$discoveredPort! Menghubungkan..."
+                }
+                pairOverHttp(discoveredIp, discoveredPort, discoveredCode, silentAuto = autoTriggered)
             } else {
                 _status.value = DesktopSyncStatus.Disconnected
-                _syncMessage.value = "Desktop ditemukan di $discoveredIp:$discoveredPort! Masukkan PIN pairing dari layar PC atau scan QR Code."
+                if (!autoTriggered) {
+                    _syncMessage.value = "Desktop ditemukan di $discoveredIp:$discoveredPort! Masukkan PIN pairing dari layar PC atau scan QR Code."
+                }
             }
         } else {
             _status.value = DesktopSyncStatus.Disconnected
             if (!autoTriggered) {
-                _syncMessage.value = "Desktop tidak ditemukan otomatis. Pastikan aplikasi Desktop berjalan di Wi-Fi yang sama (atau colok USB + aktifkan USB Debugging), lalu coba Scan QR atau izinkan Firewall Windows."
+                _syncMessage.value = "Desktop tidak ditemukan otomatis. Pastikan aplikasi Desktop berjalan di Wi-Fi yang sama, lalu coba Scan QR atau izinkan Firewall Windows."
             }
         }
     }
@@ -1080,6 +1357,7 @@ object DesktopSyncManager {
             try {
                 if (ctx != null) {
                     LocalPlaylistStore.init(ctx)
+                    OfflinePlaylists.refreshFromStorage(ctx)
                 }
 
                 // Collect Favorites
@@ -1094,19 +1372,35 @@ object DesktopSyncManager {
                     }
                 }.distinct()
 
-                // Collect Playlists from LocalPlaylistStore
+                // Collect Playlists from both LocalPlaylistStore and user-created OfflinePlaylists
                 val playlistsArr = JSONArray()
+                val pushedIds = HashSet<String>()
                 if (_syncPlaylists.value) {
                     for (pl in LocalPlaylistStore.playlists.value) {
+                        if (!pushedIds.add(pl.id)) continue
                         val songsArr = JSONArray()
                         for (s in pl.songs) {
-                            if (s.videoId.isBlank()) continue
                             songsArr.put(songToJson(s))
                         }
                         playlistsArr.put(
                             JSONObject()
                                 .put("id", pl.id)
                                 .put("title", pl.title)
+                                .put("kind", PlaylistStorage.KIND_LOCAL)
+                                .put("songs", songsArr),
+                        )
+                    }
+                    for (pl in OfflinePlaylists.playlists.value) {
+                        if (pl.isLiked || !pushedIds.add(pl.id)) continue
+                        val songsArr = JSONArray()
+                        for (s in pl.songs) {
+                            songsArr.put(songToJson(s))
+                        }
+                        playlistsArr.put(
+                            JSONObject()
+                                .put("id", pl.id)
+                                .put("title", pl.title)
+                                .put("kind", PlaylistStorage.KIND_OFFLINE)
                                 .put("songs", songsArr),
                         )
                     }
@@ -1155,18 +1449,55 @@ object DesktopSyncManager {
                         if (_syncPlaylists.value) {
                             val plArr = resJson.optJSONArray("playlists")
                             if (plArr != null) {
-                                val desktopPlaylists = mutableListOf<LocalPlaylist>()
+                                var cachedLocalCatalog: List<Song>? = null
+                                fun localCatalog(): List<Song> {
+                                    val existing = cachedLocalCatalog
+                                    if (existing != null) return existing
+                                    val loaded = if (ctx != null && LocalMediaRepository.hasStoragePermission(ctx)) {
+                                        runCatching {
+                                            kotlinx.coroutines.runBlocking { LocalMediaRepository.getLocalMusic(ctx) }
+                                        }.getOrDefault(emptyList())
+                                    } else {
+                                        emptyList()
+                                    }
+                                    cachedLocalCatalog = loaded
+                                    return loaded
+                                }
+
+                                val existingOffline = OfflinePlaylists.playlists.value.filterNot { it.isLiked }
+                                val existingOfflineIds = existingOffline.mapTo(HashSet()) { it.id }
+                                val existingOfflineTitles = existingOffline.mapTo(HashSet()) { it.title.trim().lowercase() }
+
+                                val offlineIncoming = mutableListOf<OfflinePlaylist>()
+                                val localIncoming = mutableListOf<LocalPlaylist>()
+
                                 for (i in 0 until plArr.length()) {
                                     val pObj = plArr.optJSONObject(i) ?: continue
                                     val id = pObj.optString("id", "").ifBlank { "sync_${System.currentTimeMillis()}_$i" }
                                     val title = pObj.optString("title", "").ifBlank { continue }
+                                    val kind = pObj.optString("kind", PlaylistStorage.KIND_LOCAL)
                                     val sArr = pObj.optJSONArray("songs") ?: JSONArray()
                                     val songs = (0 until sArr.length()).mapNotNull { j ->
-                                        sArr.optJSONObject(j)?.let(::jsonToSong)
+                                        val sObj = sArr.optJSONObject(j) ?: return@mapNotNull null
+                                        val parsed = PlaylistStorage.songFromJson(sObj) ?: jsonToSong(sObj) ?: return@mapNotNull null
+                                        val fileHint = sObj.optString("fileName", "").takeIf { it.isNotBlank() && it != "null" }
+                                        PlaylistStorage.resolveSong(parsed, fileHint, ::localCatalog)
                                     }
-                                    desktopPlaylists.add(LocalPlaylist(id = id, title = title, songs = songs))
+                                    val matchesOffline = kind.equals(PlaylistStorage.KIND_OFFLINE, ignoreCase = true) ||
+                                        id in existingOfflineIds ||
+                                        title.trim().lowercase() in existingOfflineTitles
+                                    if (matchesOffline) {
+                                        offlineIncoming.add(OfflinePlaylist(id = id, title = title, songs = songs))
+                                    } else {
+                                        localIncoming.add(LocalPlaylist(id = id, title = title, songs = songs))
+                                    }
                                 }
-                                LocalPlaylistStore.mergeFromSync(desktopPlaylists)
+                                if (offlineIncoming.isNotEmpty()) {
+                                    OfflinePlaylists.mergeFromSync(offlineIncoming)
+                                }
+                                if (localIncoming.isNotEmpty()) {
+                                    LocalPlaylistStore.mergeFromSync(localIncoming)
+                                }
                             }
                         }
                     }
@@ -1187,34 +1518,9 @@ object DesktopSyncManager {
         }
     }
 
-    private fun songToJson(s: Song): JSONObject = JSONObject().apply {
-        put("videoId", s.videoId)
-        put("title", s.title)
-        put("artist", s.artist)
-        put("thumbnailUrl", s.thumbnailUrl)
-        put("durationText", s.durationText)
-        put("artistId", s.artistId)
-        put("albumId", s.albumId)
-        put("albumName", s.albumName)
-        put("isVideo", s.isVideo)
-    }
+    private fun songToJson(s: Song): JSONObject = PlaylistStorage.songToJson(s)
 
-    private fun jsonToSong(obj: JSONObject): Song? {
-        val id = obj.optString("videoId", "")
-        val title = obj.optString("title", "")
-        if (id.isBlank() || title.isBlank()) return null
-        return Song(
-            videoId = id,
-            title = title,
-            artist = obj.optString("artist", ""),
-            thumbnailUrl = obj.optString("thumbnailUrl", "").takeIf { it.isNotBlank() && it != "null" },
-            durationText = obj.optString("durationText", "").takeIf { it.isNotBlank() && it != "null" },
-            artistId = obj.optString("artistId", "").takeIf { it.isNotBlank() && it != "null" },
-            albumId = obj.optString("albumId", "").takeIf { it.isNotBlank() && it != "null" },
-            albumName = obj.optString("albumName", "").takeIf { it.isNotBlank() && it != "null" },
-            isVideo = obj.optBoolean("isVideo", false),
-        )
-    }
+    private fun jsonToSong(obj: JSONObject): Song? = PlaylistStorage.songFromJson(obj)
 
     fun sendRemoteCommand(action: String, value: String? = null) {
         val currentStatus = _status.value as? DesktopSyncStatus.Connected ?: return
@@ -1250,6 +1556,14 @@ object DesktopSyncManager {
         val clamped = volume.coerceIn(0f, 1f)
         _desktopNowPlaying.value = _desktopNowPlaying.value?.copy(volume = clamped)
         sendRemoteCommand("volume", clamped.toString())
+    }
+
+    fun stepDesktopVolume(direction: Int, step: Float = 0.05f): Boolean {
+        val current = (_desktopNowPlaying.value?.volume ?: 1f).coerceIn(0f, 1f)
+        val next = (current + direction * step).coerceIn(0f, 1f)
+        if (kotlin.math.abs(next - current) < 0.001f) return false
+        setDesktopVolume(next)
+        return true
     }
 
     fun jumpDesktopQueue(index: Int) {
@@ -1335,7 +1649,33 @@ object DesktopSyncManager {
         }
     }
 
+    fun updateMobileLyrics(
+        videoId: String,
+        lines: List<LyricLine>,
+        source: String?,
+        loading: Boolean,
+        unavailable: Boolean,
+    ) {
+        val next = MobileLyricsSnapshot(
+            videoId = videoId,
+            source = source,
+            loading = loading,
+            unavailable = unavailable,
+            lines = lines,
+        )
+        if (next == mobileLyrics) return
+        mobileLyrics = next
+        mobileLyricsVersion++
+        if (!_desktopOutputActive.value && _shareNowPlaying.value && _status.value is DesktopSyncStatus.Connected) {
+            scope.launch {
+                val snap = mobileBridge?.currentPlaybackSnapshot() ?: return@launch
+                if (snap.song != null) pushMobileSnapshot(snap)
+            }
+        }
+    }
+
     fun pushMobileSnapshot(snapshot: MobilePlaybackSnapshot) {
+        lastKnownMobilePlaying = snapshot.isPlaying
         val currentStatus = _status.value as? DesktopSyncStatus.Connected ?: return
         if (!_shareNowPlaying.value) return
         scope.launch {
@@ -1349,9 +1689,15 @@ object DesktopSyncManager {
                     setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                 }
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim().ifBlank { "Android Device" }
+                val trackId = snapshot.song?.videoId.orEmpty()
+                val curLyrics = mobileLyrics
+                val curLyricsVer = mobileLyricsVersion
+                val shouldIncludeLyrics = curLyrics != null &&
+                    (curLyrics.videoId == trackId || curLyrics.videoId.isBlank()) &&
+                    (curLyricsVer != lastSentMobileLyricsVersion || trackId != lastSentMobileLyricsVideoId)
                 val payload = JSONObject()
                     .put("deviceName", deviceName)
-                    .put("videoId", snapshot.song?.videoId.orEmpty())
+                    .put("videoId", trackId)
                     .put("title", snapshot.song?.title.orEmpty())
                     .put("artist", snapshot.song?.artist.orEmpty())
                     .put("album", snapshot.song?.albumName ?: JSONObject.NULL)
@@ -1364,9 +1710,70 @@ object DesktopSyncManager {
                     .put("repeatMode", snapshot.repeatMode)
                     .put("queueIndex", snapshot.queueIndex)
                     .put("songs", JSONArray().apply { snapshot.queue.take(60).forEach { put(songToJson(it)) } })
+                if (shouldIncludeLyrics && curLyrics != null) {
+                    payload.put("lyrics", lyricsSnapshotToJson(curLyrics, curLyricsVer))
+                }
                 OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8).use { it.write(payload.toString()) }
-                conn.responseCode
+                if (conn.responseCode == 200 && shouldIncludeLyrics) {
+                    lastSentMobileLyricsVersion = curLyricsVer
+                    lastSentMobileLyricsVideoId = trackId
+                }
             } catch (_: Exception) {}
+        }
+    }
+
+    private fun lyricsSnapshotToJson(snapshot: MobileLyricsSnapshot, version: Long): JSONObject = JSONObject().apply {
+        put("version", version)
+        put("videoId", snapshot.videoId)
+        putOpt("source", snapshot.source)
+        put("loading", snapshot.loading)
+        put("unavailable", snapshot.unavailable)
+        put("lines", JSONArray().apply { snapshot.lines.forEach { put(lyricLineToJson(it)) } })
+    }
+
+    private fun lyricWordToJson(word: LyricWord): JSONObject = JSONObject().apply {
+        put("startMs", word.startMs)
+        put("endMs", word.endMs)
+        put("text", word.text)
+        if (word.syllables.isNotEmpty()) {
+            put(
+                "syllables",
+                JSONArray().apply {
+                    word.syllables.forEach { s ->
+                        put(
+                            JSONObject()
+                                .put("startMs", s.startMs)
+                                .put("endMs", s.endMs)
+                                .put("startChar", s.startChar)
+                                .put("endChar", s.endChar),
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    private fun lyricLineToJson(line: LyricLine): JSONObject = JSONObject().apply {
+        put("timeMs", line.timeMs)
+        put("text", line.text)
+        put("alignment", line.alignment.name)
+        line.sungUntilMs?.let { put("sungUntilMs", it) }
+        if (line.words.isNotEmpty()) {
+            put("words", JSONArray().apply { line.words.forEach { put(lyricWordToJson(it)) } })
+        }
+        line.background?.let { bg ->
+            put(
+                "background",
+                JSONObject().apply {
+                    put("timeMs", bg.timeMs)
+                    put("text", bg.text)
+                    put("alignment", bg.alignment.name)
+                    bg.sungUntilMs?.let { put("sungUntilMs", it) }
+                    if (bg.words.isNotEmpty()) {
+                        put("words", JSONArray().apply { bg.words.forEach { put(lyricWordToJson(it)) } })
+                    }
+                },
+            )
         }
     }
 
@@ -1393,15 +1800,20 @@ object DesktopSyncManager {
         pollingJob?.cancel()
         pollingJob = scope.launch {
             var failCount = 0
+            var mobilePlaying = false
             while (isActive && _status.value is DesktopSyncStatus.Connected) {
                 val success = fetchStatusOnce(host, port)
                 if (success) {
                     failCount = 0
+                    val snap = mobileBridge?.currentPlaybackSnapshot()
+                    mobilePlaying = snap?.isPlaying == true
+                    lastKnownMobilePlaying = mobilePlaying
                     if (!_desktopOutputActive.value && _shareNowPlaying.value) {
-                        val snap = mobileBridge?.currentPlaybackSnapshot()
                         if (snap != null && snap.song != null) {
                             pushMobileSnapshot(snap)
                         }
+                    } else {
+                        mobilePlaying = false
                     }
                 } else {
                     failCount++
@@ -1411,12 +1823,14 @@ object DesktopSyncManager {
                         _desktopNowPlaying.value = null
                         _desktopQueue.value = DesktopQueueState()
                         _desktopLyrics.value = DesktopLyricsState()
+                        lastSentMobileLyricsVersion = -1L
+                        lastSentMobileLyricsVideoId = null
                         prefs?.edit()?.putBoolean("is_connected", false)?.apply()
                         _syncMessage.value = "Koneksi ke desktop terputus"
                         break
                     }
                 }
-                val fast = _desktopOutputActive.value || _desktopNowPlaying.value?.isPlaying == true
+                val fast = _desktopOutputActive.value || _desktopNowPlaying.value?.isPlaying == true || mobilePlaying
                 delay(if (fast) 550L else 1800L)
             }
         }
@@ -1549,50 +1963,144 @@ object DesktopSyncManager {
 
         // Process any pending commands pushed from Windows Desktop (handoff/remote controls)
         val cmdsArr = obj.optJSONArray("pendingCommands")
+        val hadPendingCommands = cmdsArr != null && cmdsArr.length() > 0
         if (cmdsArr != null && cmdsArr.length() > 0) {
             val bridge = mobileBridge
             var maxId = lastAckedCommandId
+            var executedRemoteCommand = false
             for (i in 0 until cmdsArr.length()) {
                 val cmdObj = cmdsArr.optJSONObject(i) ?: continue
                 val id = cmdObj.optLong("id", 0L)
                 val action = cmdObj.optString("action", "")
                 val value = cmdObj.optString("value", "").takeIf { it.isNotBlank() && it != "null" }
                 val posMs = if (cmdObj.has("positionMs") && !cmdObj.isNull("positionMs")) cmdObj.optLong("positionMs") else null
+                val index = if (cmdObj.has("index") && !cmdObj.isNull("index")) cmdObj.optInt("index") else null
+                val from = if (cmdObj.has("from") && !cmdObj.isNull("from")) cmdObj.optInt("from") else null
+                val to = if (cmdObj.has("to") && !cmdObj.isNull("to")) cmdObj.optInt("to") else null
+                val cmdShuffle = if (cmdObj.has("shuffle") && !cmdObj.isNull("shuffle")) cmdObj.optBoolean("shuffle") else null
+                val cmdRepeat = if (cmdObj.has("repeatMode") && !cmdObj.isNull("repeatMode")) cmdObj.optInt("repeatMode") else null
                 if (id > maxId) maxId = id
 
                 when (action.lowercase(Locale.ROOT)) {
+                    "play_song" -> {
+                        val remoteSong = cmdObj.optJSONObject("song")?.let { jsonToRemoteSong(it, connectedHost, connectedPort) }
+                        val playNow = if (cmdObj.has("isPlaying") && !cmdObj.isNull("isPlaying")) cmdObj.optBoolean("isPlaying") else true
+                        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
+                        needsInitialOutputSync = false
+                        _desktopOutputActive.value = false
+                        if (remoteSong != null) {
+                            bridge?.playFromDesktop(listOf(remoteSong), 0, isOneOff = true, isPlaying = playNow)
+                            executedRemoteCommand = true
+                        }
+                    }
+                    "play_songs" -> {
+                        val arr = cmdObj.optJSONArray("songs") ?: JSONArray()
+                        val songs = (0 until arr.length()).mapNotNull { j ->
+                            arr.optJSONObject(j)?.let { jsonToRemoteSong(it, connectedHost, connectedPort) }
+                        }
+                        val idx = index ?: 0
+                        val playNow = if (cmdObj.has("isPlaying") && !cmdObj.isNull("isPlaying")) cmdObj.optBoolean("isPlaying") else true
+                        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
+                        needsInitialOutputSync = false
+                        _desktopOutputActive.value = false
+                        if (songs.isNotEmpty()) {
+                            bridge?.playFromDesktop(songs, idx.coerceIn(songs.indices), isOneOff = false, isPlaying = playNow)
+                            executedRemoteCommand = true
+                        }
+                    }
+                    "enqueue_song" -> {
+                        val remoteSong = cmdObj.optJSONObject("song")?.let { jsonToRemoteSong(it, connectedHost, connectedPort) }
+                        val playNextFlag = cmdObj.optBoolean("playNext", false)
+                        if (remoteSong != null) {
+                            bridge?.enqueueFromDesktop(remoteSong, playNextFlag)
+                            executedRemoteCommand = true
+                        }
+                    }
                     "handoff_play" -> {
                         val arr = cmdObj.optJSONArray("songs") ?: JSONArray()
                         val songs = (0 until arr.length()).mapNotNull { j ->
                             arr.optJSONObject(j)?.let { jsonToRemoteSong(it, connectedHost, connectedPort) }
                         }
-                        val idx = cmdObj.optInt("index", 0)
+                        val idx = index ?: 0
                         val startPos = posMs ?: 0L
                         val playNow = cmdObj.optBoolean("isPlaying", true)
-                        val shuffle = if (cmdObj.has("shuffle") && !cmdObj.isNull("shuffle")) cmdObj.optBoolean("shuffle") else null
-                        val repeat = if (cmdObj.has("repeatMode") && !cmdObj.isNull("repeatMode")) cmdObj.optInt("repeatMode") else null
+                        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
+                        needsInitialOutputSync = false
                         _desktopOutputActive.value = false
                         if (songs.isNotEmpty()) {
-                            bridge?.applyHandoffFromDesktop(songs, idx.coerceIn(songs.indices), startPos, playNow, shuffle, repeat)
+                            bridge?.applyHandoffFromDesktop(songs, idx.coerceIn(songs.indices), startPos, playNow, cmdShuffle, cmdRepeat)
+                            executedRemoteCommand = true
                         }
                     }
                     "pause_for_desktop_handoff" -> {
                         bridge?.pauseLocalPlayback()
+                        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
+                        needsInitialOutputSync = false
                         _desktopOutputActive.value = true
                     }
                     "select_desktop_output" -> {
+                        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
+                        needsInitialOutputSync = false
                         _desktopOutputActive.value = true
                     }
                     "select_mobile_output" -> {
+                        lastOutputSwitchElapsedMs = SystemClock.elapsedRealtime()
+                        needsInitialOutputSync = false
                         _desktopOutputActive.value = false
+                        lastSentMobileLyricsVersion = -1L
                     }
                     else -> {
-                        bridge?.applyRemoteCommandFromDesktop(action, value, posMs)
+                        bridge?.applyRemoteCommandFromDesktop(
+                            action = action,
+                            value = value,
+                            positionMs = posMs,
+                            index = index,
+                            from = from,
+                            to = to,
+                            shuffle = cmdShuffle,
+                            repeatMode = cmdRepeat,
+                        )
+                        executedRemoteCommand = true
                     }
                 }
             }
             if (maxId > lastAckedCommandId) {
                 lastAckedCommandId = maxId
+            }
+            if (executedRemoteCommand && !_desktopOutputActive.value && _shareNowPlaying.value) {
+                scope.launch {
+                    delay(140L)
+                    mobileBridge?.currentPlaybackSnapshot()?.let { snap ->
+                        if (snap.song != null) pushMobileSnapshot(snap)
+                    }
+                    delay(320L)
+                    mobileBridge?.currentPlaybackSnapshot()?.let { snap ->
+                        if (snap.song != null) pushMobileSnapshot(snap)
+                    }
+                }
+            }
+        }
+
+        // Keep Android & Desktop output mode locked to one active player so both never play separate songs simultaneously.
+        val serverOutput = obj.optString("activeOutput", "")
+        val desktopPlayingNow = obj.optJSONObject("nowPlaying")?.optBoolean("isPlaying", false) == true
+        if (!hadPendingCommands && (needsInitialOutputSync || (SystemClock.elapsedRealtime() - lastOutputSwitchElapsedMs) > 2500L)) {
+            if (needsInitialOutputSync) {
+                needsInitialOutputSync = false
+                when (serverOutput) {
+                    "desktop" -> if (desktopPlayingNow || !lastKnownMobilePlaying) {
+                        if (desktopPlayingNow) mobileBridge?.pauseLocalPlayback()
+                        _desktopOutputActive.value = true
+                    }
+                    "mobile" -> _desktopOutputActive.value = false
+                }
+            } else {
+                if (serverOutput == "desktop" && desktopPlayingNow && !_desktopOutputActive.value) {
+                    mobileBridge?.pauseLocalPlayback()
+                    _desktopOutputActive.value = true
+                } else if (serverOutput == "mobile" && _desktopOutputActive.value) {
+                    _desktopOutputActive.value = false
+                }
             }
         }
 
@@ -1703,6 +2211,63 @@ object DesktopSyncManager {
             shuffle = shuffle,
             repeatMode = repeatMode,
         )
+        publishDesktopWidgetState()
+    }
+
+    private fun publishDesktopWidgetState() {
+        val ctx = appContext ?: return
+        if (!_desktopOutputActive.value || _status.value !is DesktopSyncStatus.Connected) return
+        val np = _desktopNowPlaying.value ?: return
+        val q = _desktopQueue.value
+        val l = _desktopLyrics.value
+        val mediaId = np.videoId.ifBlank { "${np.title}|${np.artist}" }
+        val snapshot = MediaWidgetSnapshot(
+            mediaId = mediaId,
+            title = np.title,
+            artist = np.artist,
+            artworkUrl = np.thumbnailUrl,
+            isPlaying = np.isPlaying,
+            hasPrevious = q.hasPrevious || q.queueIndex > 0,
+            hasNext = q.hasNext || q.queueIndex < q.songs.lastIndex,
+            isLiked = np.isLiked,
+            canLike = np.videoId.isNotBlank() && !np.videoId.startsWith("local:"),
+            shuffleEnabled = np.shuffle,
+        )
+        MediaWidgetSnapshot.save(ctx, snapshot)
+
+        val posMs = desktopPosition.positionMs.coerceAtLeast(0L)
+        val lines = l.lines.takeIf { l.videoId.isBlank() || l.videoId == np.videoId }
+        val resolved = LyricCueResolver.resolve(
+            lines = lines,
+            positionMs = posMs,
+            title = np.title,
+            artist = np.artist,
+            loadingLabel = ctx.getString(R.string.widget_lyric_loading),
+            unavailableLabel = ctx.getString(R.string.widget_lyric_unavailable),
+            lyricsLoading = l.loading,
+        )
+        LyricWidgetState.save(
+            ctx,
+            LyricWidgetState(
+                mediaId = mediaId,
+                currentLyric = resolved.current,
+                nextLyric = resolved.next,
+                hasSyncedLyrics = resolved.hasSyncedLines,
+                lyricsLoading = l.loading,
+                positionMs = posMs,
+                durationMs = np.durationMs.coerceAtLeast(0L),
+            ),
+        )
+
+        val snapKey = "${snapshot.mediaId}|${snapshot.title}|${snapshot.artist}|${snapshot.artworkUrl}|${snapshot.isPlaying}|${snapshot.isLiked}|${snapshot.shuffleEnabled}|${snapshot.hasPrevious}|${snapshot.hasNext}"
+        if (snapKey != lastWidgetSnapshotKey) {
+            lastWidgetSnapshotKey = snapKey
+            MediaWidget.refresh(ctx)
+            MediaWidgetPill.refresh(ctx)
+            LyricWidget.refresh(ctx)
+        } else {
+            LyricWidget.tick(ctx)
+        }
     }
 
     fun formatLastSynced(timestamp: Long?): String {

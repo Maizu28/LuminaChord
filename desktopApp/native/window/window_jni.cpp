@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <dwmapi.h>
+#include <endpointvolume.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <mmdeviceapi.h>
 #include <propvarutil.h>
@@ -948,6 +949,52 @@ Java_com_music_bitchord_desktop_DesktopWindowsAudio_nativeLastError(JNIEnv* env,
     return env->NewString(
         reinterpret_cast<const jchar*>(g_audio_error.c_str()),
         static_cast<jsize>(g_audio_error.size()));
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_music_bitchord_desktop_DesktopWindowsAudio_nativeGetMasterVolume(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> guard(g_audio_mutex);
+    ComScope com;
+    if (!com.ready()) return -1.0f;
+    IMMDevice* device = resolve_device_locked(g_audio_wanted);
+    if (device == nullptr) return -1.0f;
+    IAudioEndpointVolume* endpoint = nullptr;
+    float level = -1.0f;
+    if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(&endpoint))) && endpoint != nullptr) {
+        float raw = 0.0f;
+        BOOL muted = FALSE;
+        if (SUCCEEDED(endpoint->GetMasterVolumeLevelScalar(&raw))) {
+            level = (SUCCEEDED(endpoint->GetMute(&muted)) && muted) ? 0.0f : std::clamp(raw, 0.0f, 1.0f);
+        }
+        endpoint->Release();
+    }
+    device->Release();
+    return static_cast<jfloat>(level);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_music_bitchord_desktop_DesktopWindowsAudio_nativeSetMasterVolume(JNIEnv*, jclass, jfloat volume) {
+    std::lock_guard<std::mutex> guard(g_audio_mutex);
+    ComScope com;
+    if (!com.ready()) return JNI_FALSE;
+    IMMDevice* device = resolve_device_locked(g_audio_wanted);
+    if (device == nullptr) return JNI_FALSE;
+    IAudioEndpointVolume* endpoint = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(&endpoint))) && endpoint != nullptr) {
+        const float clamped = std::clamp(static_cast<float>(volume), 0.0f, 1.0f);
+        if (SUCCEEDED(endpoint->SetMasterVolumeLevelScalar(clamped, nullptr))) {
+            if (clamped > 0.001f) {
+                endpoint->SetMute(FALSE, nullptr);
+            }
+            ok = true;
+        }
+        endpoint->Release();
+    }
+    device->Release();
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 }  // extern "C"

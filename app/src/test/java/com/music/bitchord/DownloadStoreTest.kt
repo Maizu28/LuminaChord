@@ -3,12 +3,16 @@ package com.music.bitchord
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.settings.AudioQuality
+import com.music.bitchord.data.settings.DownloadFormat
 import com.music.bitchord.data.settings.DownloadQuality
+import com.music.bitchord.data.lyrics.EmbeddedLyrics
 import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.StreamRequest
+import com.music.bitchord.download.DownloadEncoder
 import com.music.bitchord.download.DownloadStore
 import com.music.bitchord.download.Downloader
 import com.music.bitchord.download.Downloads
+import com.music.bitchord.download.Mp3Tagger
 import com.music.bitchord.download.SavedSongMetadata
 import com.music.bitchord.download.resolvedDownloadDates
 import com.music.bitchord.download.youtubeDownloadBadge
@@ -310,5 +314,50 @@ class DownloadStoreTest {
         assertNull(Downloads.estimatedKbps(null, 240))
         assertNull(Downloads.estimatedKbps(9_600_000, null))
         assertNull(Downloads.estimatedKbps(9_600_000, 0))
+    }
+
+    @Test
+    fun `download format defaults to MP3 and keeps FLAC lossless`() {
+        assertEquals(DownloadFormat.MP3, AppSettings.downloadFormat.value)
+        assertEquals("flac", Downloads.targetExtension("flac", DownloadFormat.MP3))
+        assertEquals("flac", Downloads.targetExtension("FLAC", DownloadFormat.WEBM))
+        assertEquals("mp3", Downloads.targetExtension("webm", DownloadFormat.MP3))
+        assertEquals("mp3", Downloads.targetExtension("m4a", DownloadFormat.MP3))
+        assertEquals("webm", Downloads.targetExtension("m4a", DownloadFormat.WEBM))
+        assertEquals("webm", Downloads.targetExtension("webm", DownloadFormat.WEBM))
+    }
+
+    @Test
+    fun `android LAME stream encoder writes MP3 frames and Mp3Tagger round-trips lyrics`() {
+        val sampleRate = 44100
+        val frames = sampleRate / 2
+        val pcm = ShortArray(frames * 2) { idx ->
+            (kotlin.math.sin(2.0 * kotlin.math.PI * 440.0 * (idx / 2) / sampleRate) * 12000).toInt().toShort()
+        }
+        val mp3Out = java.io.ByteArrayOutputStream()
+        val enc = DownloadEncoder.Mp3StreamEncoder(sampleRate, 2, 192, mp3Out)
+        try {
+            enc.writeInterleavedShorts(pcm, frames)
+            enc.finish()
+        } finally {
+            enc.closeQuietly()
+        }
+        val rawMp3 = mp3Out.toByteArray()
+        assertTrue(rawMp3.size > 1024)
+
+        val lrc = "[00:01.00] Hello world\n[00:04.50] LuminaChord"
+        val tagged = Mp3Tagger.tag(
+            rawMp3,
+            title = "Take A Chance With Me",
+            artist = "NIKI",
+            album = "Nicole",
+            lyrics = lrc,
+            cover = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte()),
+            coverMime = "image/jpeg",
+        )
+        assertEquals('I'.code.toByte(), tagged[0])
+        assertEquals('D'.code.toByte(), tagged[1])
+        assertEquals('3'.code.toByte(), tagged[2])
+        assertEquals(lrc, EmbeddedLyrics.fromBytes(tagged))
     }
 }

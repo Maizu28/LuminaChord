@@ -82,9 +82,24 @@ class DesktopPersistence {
 
     fun saveDownloads(songs: List<Song>) = writeSongs(KEY_DOWNLOADS, songs)
 
-    fun playlists(): List<DesktopPlaylist> = readLines(KEY_PLAYLISTS).mapNotNull(::decodePlaylist)
+    fun playlists(): List<DesktopPlaylist> = DesktopPlaylistStore.load(
+        legacyPlaylists = readLines(KEY_PLAYLISTS).mapNotNull(::decodePlaylist),
+        alreadyMigrated = preferences.getBoolean(KEY_PLAYLISTS_MIGRATED, false),
+        markMigrated = {
+            preferences.putBoolean(KEY_PLAYLISTS_MIGRATED, true)
+            runCatching { preferences.flush() }
+        },
+    )
 
-    fun savePlaylists(playlists: List<DesktopPlaylist>) = writeLines(KEY_PLAYLISTS, playlists.map(DesktopPlaylist::toPreferenceLine))
+    fun savePlaylists(playlists: List<DesktopPlaylist>) {
+        val savedToFolder = DesktopPlaylistStore.saveAll(playlists)
+        if (savedToFolder) {
+            preferences.putBoolean(KEY_PLAYLISTS_MIGRATED, true)
+            runCatching { preferences.flush() }
+        } else {
+            writeLines(KEY_PLAYLISTS, playlists.map(DesktopPlaylist::toPreferenceLine))
+        }
+    }
 
     fun boolean(key: String, default: Boolean): Boolean = preferences.getBoolean(key, default)
 
@@ -300,6 +315,7 @@ class DesktopPersistence {
         const val KEY_QUEUE = "queue"
         const val KEY_DOWNLOADS = "downloads"
         const val KEY_PLAYLISTS = "playlists"
+        const val KEY_PLAYLISTS_MIGRATED = "playlists_migrated_v1"
         const val KEY_MODULE_INDEX_URL = "module_index_url"
         private const val KEY_ORIGINAL_VERSIONS = "original_versions"
         private const val KEY_AUDIO_QUALITY = "audio_quality"

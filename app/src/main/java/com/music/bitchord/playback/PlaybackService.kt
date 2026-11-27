@@ -83,6 +83,7 @@ import com.music.bitchord.playback.cast.CastSink
 import com.music.bitchord.playback.cast.RemoteSpeaker
 import com.music.bitchord.playback.cast.Speakers
 import com.music.bitchord.playback.cast.CastStream
+import com.music.bitchord.sync.DesktopRemoteSpeaker
 import com.music.bitchord.playback.audio.PrecisionAudioSink
 import com.music.bitchord.playback.dsd.DsdExtractorsFactory
 import com.music.bitchord.playback.audio.DirectAudioProbe
@@ -843,8 +844,10 @@ class PlaybackService : MediaLibraryService() {
         WearBridge.createSpeaker(this, scope, localPlayer = { player }, onChanged = { publishWidgetState() })
     }
 
+    private val desktopSpeaker by lazy { DesktopRemoteSpeaker(scope) }
+
     /** Every remote speaker, as the one the session player reports. */
-    private val speakers by lazy { Speakers(listOf(castPlayback, watchSpeaker)) }
+    private val speakers by lazy { Speakers(listOf(castPlayback, watchSpeaker, desktopSpeaker)) }
 
     /**
      * Binds playback to a Listen Together party, when there is one.
@@ -2092,7 +2095,9 @@ class PlaybackService : MediaLibraryService() {
         deferPlayToParty = { partySync?.shouldDeferPlay() == true },
         lockedTransport = { playing -> partySync?.onLockedTransport(playing) == true },
         cast = speakers,
+        desktop = desktopSpeaker,
         onShuffleRequest = ::toggleShuffleFromSession,
+        refreshCustomLayout = ::refreshCustomLayouts,
     ) { lastPublishedSubtitle }
 
     /**
@@ -2323,18 +2328,17 @@ class PlaybackService : MediaLibraryService() {
 
     /** Favorite and Shuffle: the only actions shown on the phone notification. */
     private fun notificationButtons(): List<CommandButton> {
-        val liked = isLiked(player?.currentMediaItem)
-        // The icon constant tells controllers like Android Auto what the button
-        // means; the custom drawable swaps Material's sharp star for the
-        // player's rounded one on the notification itself.
-        val favorite = if (!canLike(player?.currentMediaItem)) null else CommandButton.Builder(
+        val desktopActive = desktopSpeaker.active
+        val liked = if (desktopActive) desktopSpeaker.isLiked else isLiked(player?.currentMediaItem)
+        val allowLike = if (desktopActive) desktopSpeaker.canLike else canLike(player?.currentMediaItem)
+        val favorite = if (!allowLike) null else CommandButton.Builder(
             if (liked) CommandButton.ICON_STAR_FILLED else CommandButton.ICON_STAR_UNFILLED,
         )
             .setCustomIconResId(if (liked) R.drawable.ic_notification_star_filled else R.drawable.ic_notification_star)
             .setSessionCommand(favoriteCommand)
             .setDisplayName("Favorite")
             .build()
-        val shuffleEnabled = QueueShuffle.enabled.value
+        val shuffleEnabled = if (desktopActive) desktopSpeaker.shuffleEnabled else QueueShuffle.enabled.value
         val shuffle = CommandButton.Builder(
             if (shuffleEnabled) {
                 CommandButton.ICON_SHUFFLE_ON
@@ -3443,6 +3447,10 @@ class PlaybackService : MediaLibraryService() {
     }
 
     private fun toggleShuffleFromSession() {
+        if (desktopSpeaker.active) {
+            desktopSpeaker.toggleShuffle()
+            return
+        }
         crossfade?.cancelAutoMixVisual()
         val window = boundedContextWindow
         if (window != null && !ListenTogether.state.value.inParty) {
@@ -7037,6 +7045,7 @@ class PlaybackService : MediaLibraryService() {
      * play right up to the moment it is released.
      */
     private fun publishWidgetState(playing: Boolean? = null) {
+        if (desktopSpeaker.active) return
         val exoPlayer = player ?: return
         val song = exoPlayer.currentMediaItem?.toSong() ?: return
         // LikeState only knows ratings this process has seen: a fresh service
@@ -8963,9 +8972,11 @@ class PlaybackService : MediaLibraryService() {
         private val lockedTransport: (Boolean) -> Boolean,
         /** Cast or the watch, whichever is the speaker — its clock is what this reports. */
         private val cast: RemoteSpeaker,
+        private val desktop: DesktopRemoteSpeaker,
         private val onQueueUndoRouteChanged: () -> Unit,
         /** Flips the app's own shuffle — the queue edit in [QueueShuffle]. */
         private val onShuffleRequest: () -> Unit,
+        private val refreshCustomLayout: () -> Unit,
         private val getSubtitle: () -> String?,
     ) : ForwardingPlayer(player), CastSink {
 
@@ -9008,6 +9019,32 @@ class PlaybackService : MediaLibraryService() {
                 Player.COMMAND_ADJUST_DEVICE_VOLUME,
                 Player.COMMAND_ADJUST_DEVICE_VOLUME_WITH_FLAGS,
             )
+
+            val DESKTOP_COMMANDS: Player.Commands = Player.Commands.Builder()
+                .addAll(
+                    Player.COMMAND_PLAY_PAUSE,
+                    Player.COMMAND_PREPARE,
+                    Player.COMMAND_STOP,
+                    Player.COMMAND_SEEK_TO_DEFAULT_POSITION,
+                    Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_BACK,
+                    Player.COMMAND_SEEK_FORWARD,
+                    Player.COMMAND_SEEK_TO_PREVIOUS,
+                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_TO_NEXT,
+                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_TO_MEDIA_ITEM,
+                    Player.COMMAND_SET_SHUFFLE_MODE,
+                    Player.COMMAND_GET_CURRENT_MEDIA_ITEM,
+                    Player.COMMAND_GET_TIMELINE,
+                    Player.COMMAND_GET_METADATA,
+                    Player.COMMAND_GET_DEVICE_VOLUME,
+                    Player.COMMAND_SET_DEVICE_VOLUME,
+                    Player.COMMAND_SET_DEVICE_VOLUME_WITH_FLAGS,
+                    Player.COMMAND_ADJUST_DEVICE_VOLUME,
+                    Player.COMMAND_ADJUST_DEVICE_VOLUME_WITH_FLAGS,
+                )
+                .build()
         }
 
         /** The DAC's own volume stands in for the device's, unless a receiver is the speaker. */
@@ -9015,12 +9052,19 @@ class PlaybackService : MediaLibraryService() {
 
         private fun dacVolume(): Int = ((DacVolume.level.value ?: 0f) * 100).roundToInt()
 
-        override fun getAvailableCommands(): Player.Commands =
-            if (dac) super.getAvailableCommands().buildUpon().addAll(*DEVICE_VOLUME_COMMANDS).build()
-            else super.getAvailableCommands()
+        override fun getAvailableCommands(): Player.Commands = when {
+            desktop.active -> DESKTOP_COMMANDS
+            cast.active -> super.getAvailableCommands().buildUpon().addAll(*DEVICE_VOLUME_COMMANDS).build()
+            dac -> super.getAvailableCommands().buildUpon().addAll(*DEVICE_VOLUME_COMMANDS).build()
+            else -> super.getAvailableCommands()
+        }
 
-        override fun isCommandAvailable(command: Int): Boolean =
-            (dac && command in DEVICE_VOLUME_COMMANDS) || super.isCommandAvailable(command)
+        override fun isCommandAvailable(command: Int): Boolean = when {
+            desktop.active -> DESKTOP_COMMANDS.contains(command)
+            cast.active && command in DEVICE_VOLUME_COMMANDS -> true
+            dac && command in DEVICE_VOLUME_COMMANDS -> true
+            else -> super.isCommandAvailable(command)
+        }
 
         /**
          * The DAC volume came or went ([routeChanged]), or moved. Told by the
@@ -9234,11 +9278,43 @@ class PlaybackService : MediaLibraryService() {
 
         override fun onRemoteRouteChanged() {
             onQueueUndoRouteChanged()
+            val commands = availableCommands
+            listeners.forEach { it.onAvailableCommandsChanged(commands) }
             val info = getDeviceInfo()
             listeners.forEach { it.onDeviceInfoChanged(info) }
-            val events = Player.Events(FlagSet.Builder().add(Player.EVENT_DEVICE_INFO_CHANGED).build())
+            val events = Player.Events(
+                FlagSet.Builder()
+                    .add(Player.EVENT_AVAILABLE_COMMANDS_CHANGED)
+                    .add(Player.EVENT_DEVICE_INFO_CHANGED)
+                    .build(),
+            )
             listeners.forEach { it.onEvents(this, events) }
             onRemoteVolumeChanged()
+        }
+
+        override fun onRemoteTrackOrQueueChanged() {
+            val tl = currentTimeline
+            val idx = currentMediaItemIndex
+            val item = currentMediaItem
+            val meta = mediaMetadata
+            val commands = availableCommands
+            listeners.forEach {
+                it.onTimelineChanged(tl, Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED)
+                it.onMediaItemTransition(item, Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED)
+                it.onMediaMetadataChanged(meta)
+                it.onAvailableCommandsChanged(commands)
+            }
+            val events = Player.Events(
+                FlagSet.Builder()
+                    .add(Player.EVENT_TIMELINE_CHANGED)
+                    .add(Player.EVENT_MEDIA_ITEM_TRANSITION)
+                    .add(Player.EVENT_MEDIA_METADATA_CHANGED)
+                    .add(Player.EVENT_AVAILABLE_COMMANDS_CHANGED)
+                    .build(),
+            )
+            listeners.forEach { it.onEvents(this, events) }
+            refreshCustomLayout()
+            onRemotePlaybackChanged()
         }
 
         override fun onRemoteVolumeChanged() {
@@ -9319,17 +9395,40 @@ class PlaybackService : MediaLibraryService() {
          * passed down: the request becomes the app's shuffle instead, which
          * rearranges the queue itself (see [QueueShuffle]).
          */
+        override fun getCurrentTimeline(): Timeline =
+            if (desktop.active) desktop.timeline() else super.getCurrentTimeline()
+
+        override fun getMediaItemCount(): Int =
+            if (desktop.active) desktop.mediaItemCount() else super.getMediaItemCount()
+
+        override fun getMediaItemAt(index: Int): MediaItem =
+            if (desktop.active) desktop.mediaItemAt(index) else super.getMediaItemAt(index)
+
+        override fun getCurrentMediaItemIndex(): Int =
+            if (desktop.active) desktop.currentMediaItemIndex() else super.getCurrentMediaItemIndex()
+
+        override fun getCurrentPeriodIndex(): Int =
+            if (desktop.active) desktop.currentMediaItemIndex() else super.getCurrentPeriodIndex()
+
+        override fun getCurrentMediaItem(): MediaItem? =
+            if (desktop.active) desktop.currentMediaItem() else super.getCurrentMediaItem()
+
+        override fun hasPreviousMediaItem(): Boolean =
+            if (desktop.active) desktop.hasPrevious() else super.hasPreviousMediaItem()
+
+        override fun hasNextMediaItem(): Boolean =
+            if (desktop.active) desktop.hasNext() else super.hasNextMediaItem()
+
         override fun setShuffleModeEnabled(shuffleModeEnabled: Boolean) {
+            if (desktop.active) {
+                if (shuffleModeEnabled != desktop.shuffleEnabled) desktop.toggleShuffle()
+                return
+            }
             if (shuffleModeEnabled != QueueShuffle.enabled.value) onShuffleRequest()
         }
 
-        /**
-         * The app's shuffle, not ExoPlayer's (always off): what an outside
-         * controller draws its button from. Reporting ExoPlayer's left a car
-         * showing shuffle off, so its next tap asked for "on" again and shuffle
-         * could be turned on from the car but never off.
-         */
-        override fun getShuffleModeEnabled(): Boolean = QueueShuffle.enabled.value
+        override fun getShuffleModeEnabled(): Boolean =
+            if (desktop.active) desktop.shuffleEnabled else QueueShuffle.enabled.value
 
         /** [QueueShuffle] changed; tell the controllers, which never hear it from ExoPlayer. */
         fun onShuffleChanged(enabled: Boolean) {
@@ -9390,6 +9489,10 @@ class PlaybackService : MediaLibraryService() {
         override fun seekToPrevious() {
             if (locked()) return
             onAutoMixInterruptingIntent()
+            if (desktop.active) {
+                desktop.previous()
+                return
+            }
             if (cast.active) {
                 castPrevious()
                 return
@@ -9489,6 +9592,7 @@ class PlaybackService : MediaLibraryService() {
         }
 
         override fun getMediaMetadata(): MediaMetadata {
+            if (desktop.active) return desktop.currentMetadata()
             val base = wrappedPlayer.mediaMetadata
             val subtitle = getSubtitle()
             return if (!subtitle.isNullOrBlank()) {
@@ -9498,10 +9602,17 @@ class PlaybackService : MediaLibraryService() {
             }
         }
 
+        override fun getPlaylistMetadata(): MediaMetadata =
+            if (desktop.active) desktop.currentMetadata() else super.getPlaylistMetadata()
+
         override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
             if (locked()) return
             onUserIntent()
             crossfade.onSkipRequested()
+            if (desktop.active) {
+                desktop.seekOrJump(mediaItemIndex, positionMs)
+                return
+            }
             if (mediaItemIndex !in 0 until wrappedPlayer.mediaItemCount) return
             // The track already on the receiver: a position in it is the
             // receiver's to seek, not the paused phone's.
@@ -9547,6 +9658,10 @@ class PlaybackService : MediaLibraryService() {
             if (locked()) return
             onUserIntent()
             crossfade.onSkipRequested()
+            if (desktop.active) {
+                desktop.previous()
+                return
+            }
             if (cast.active) {
                 castPrevious()
                 return
@@ -9558,6 +9673,10 @@ class PlaybackService : MediaLibraryService() {
             if (locked()) return
             onUserIntent()
             crossfade.onSkipRequested()
+            if (desktop.active) {
+                desktop.next()
+                return
+            }
             wrappedPlayer.seekToNextMediaItem()
         }
 
@@ -9565,6 +9684,10 @@ class PlaybackService : MediaLibraryService() {
             if (locked()) return
             onUserIntent()
             crossfade.onSkipRequested()
+            if (desktop.active) {
+                desktop.next()
+                return
+            }
             wrappedPlayer.seekToNext()
         }
     }
@@ -9696,7 +9819,9 @@ class PlaybackService : MediaLibraryService() {
                 }
                 // A widget or watch drawn before the track changed can still
                 // send this for one the player offers no Like on.
-                ACTION_TOGGLE_FAVORITE -> session.player.currentMediaItem
+                ACTION_TOGGLE_FAVORITE -> if (desktopSpeaker.active) {
+                    desktopSpeaker.toggleFavorite()
+                } else session.player.currentMediaItem
                     ?.takeIf(::canLike)
                     ?.let { item ->
                         val song = item.toSong()

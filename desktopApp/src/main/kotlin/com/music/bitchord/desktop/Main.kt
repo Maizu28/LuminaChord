@@ -49,6 +49,7 @@ fun main() {
     SpotifyLibrary.auth = SpotifyLibrary.Auth {
         DesktopSpotifyToken.accessToken()?.let { SpotifyLibrary.Tokens(it, DesktopSpotifyToken.clientToken()) }
     }
+    SpotifyLibrary.onUnauthorized = { DesktopSpotifyToken.markTokenRejected() }
     // Desktop follows its own language picker (zh-Hant / zh-Hans preserved).
     com.music.bitchord.data.innertube.Innertube.appLanguage = { DesktopStrings.resolvedTag() }
     // YouTube playback is the phone's StreamResolver over InnerTubeX, with BotGuard PoTokens
@@ -118,6 +119,7 @@ private fun desktopMain() = application {
         // material is possible and the chosen one can be switched live — see [DesktopWindowBackdrop].
         transparent = DesktopWindowBackdrop.available,
         resizable = true,
+        onPreviewKeyEvent = { DesktopShortcutSettings.dispatchWindowKeyEvent(it) },
     ) {
         val composeWindow = window
         val openingSize = remember { state.size }

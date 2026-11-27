@@ -56,6 +56,10 @@ object SpotifyLibrary {
     @Volatile
     var auth: Auth? = null
 
+    /** Optional hook invoked when a GraphQL call returns HTTP 401/429 so the host can re-mint tokens. */
+    @Volatile
+    var onUnauthorized: (() -> Unit)? = null
+
     private const val GQL = "https://api-partner.spotify.com/pathfinder/v2/query"
     private const val LIBRARY = "973e511ca44261fda7eebac8b653155e7caee3675abb4fb110cc1b8c78b091c3"
     private const val PLAYLIST = "346811f856fb0b7e4f6c59f8ebea78dd081c6e2fb01b77c954b26259d5fc6763"
@@ -73,11 +77,21 @@ object SpotifyLibrary {
 
     /** Every playlist in the library, however many pages it takes. */
     suspend fun playlists(): List<SpotifyPlaylist> = withContext(Dispatchers.IO) {
-        val headers = authHeaders()
         val collected = mutableListOf<SpotifyPlaylist>()
         var offset = 0
+        var headers = authHeaders()
         while (true) {
-            val (items, total, raw) = playlistPage(headers, offset)
+            val (items, total, raw) = try {
+                playlistPage(headers, offset)
+            } catch (e: HttpStatusException) {
+                if ((e.code == 401 || e.code == 429) && onUnauthorized != null) {
+                    onUnauthorized?.invoke()
+                    headers = authHeaders()
+                    playlistPage(headers, offset)
+                } else {
+                    throw e
+                }
+            }
             collected += items
             offset += raw
             if (raw == 0 || offset >= total) break
@@ -96,14 +110,23 @@ object SpotifyLibrary {
         playlistId: String,
         onPage: (List<SpotifyTrack>) -> Unit = {},
     ): List<SpotifyTrack> = withContext(Dispatchers.IO) {
-        val headers = authHeaders()
+        var headers = authHeaders()
         val collected = mutableListOf<SpotifyTrack>()
         var offset = 0
         while (true) {
-            val (items, total, raw) = if (playlistId == LIKED_ID) {
-                likedPage(headers, offset)
-            } else {
-                trackPage(headers, playlistId, offset)
+            val pageFetch = { h: Map<String, String> ->
+                if (playlistId == LIKED_ID) likedPage(h, offset) else trackPage(h, playlistId, offset)
+            }
+            val (items, total, raw) = try {
+                pageFetch(headers)
+            } catch (e: HttpStatusException) {
+                if ((e.code == 401 || e.code == 429) && onUnauthorized != null) {
+                    onUnauthorized?.invoke()
+                    headers = authHeaders()
+                    pageFetch(headers)
+                } else {
+                    throw e
+                }
             }
             collected += items
             offset += raw
@@ -206,7 +229,7 @@ object SpotifyLibrary {
         val text = Http.client.newCall(request).execute().use { response ->
             val payload = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                throw IllegalStateException("Spotify $operation failed (${response.code})")
+                throw HttpStatusException(response.code, "Spotify $operation failed (${response.code})")
             }
             payload
         }
@@ -215,6 +238,8 @@ object SpotifyLibrary {
         if (!error.isNullOrBlank()) throw IllegalStateException(error)
         return root
     }
+
+    private class HttpStatusException(val code: Int, message: String) : IllegalStateException(message)
 }
 
 /** The playlists kept, the library's total, and how many entries the page held before filtering. */

@@ -250,6 +250,15 @@ android {
             isReturnDefaultValues = true
         }
     }
+    applicationVariants.all {
+        val vName = versionName ?: (rootProject.extra["bitchordVersionName"] as String)
+        val appPrefix = if (flavorName == "dev") "LuminaChord-Dev" else "LuminaChord"
+        outputs.all {
+            val out = this as? com.android.build.gradle.internal.api.BaseVariantOutputImpl ?: return@all
+            val abi = out.getFilter(com.android.build.OutputFile.ABI) ?: "universal"
+            out.outputFileName = "$appPrefix-v$vName-$abi.apk"
+        }
+    }
 }
 
 kotlin {
@@ -351,6 +360,9 @@ dependencies {
     // libffmpegJNI.so under src/main/jniLibs is built from librempeg (the only
     // FFmpeg line with an AC-4 decoder) by native/ffmpeg/build.sh. It needs
     // media3-decoder, which media3-exoplayer already brings.
+    // Audio decoders / utilities.
+    implementation("de.sciss:jump3r:1.0.5")
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.9.0")
 
     // ---- Images: Coil 3 + Palette (dominant colors for the mesh gradient) ----

@@ -34,7 +34,12 @@ object DesktopLocalMusic {
         val chosen = folder()
         if (chosen != null) return listOf(chosen)
         val home = Paths.get(System.getProperty("user.home"))
-        return listOf(home.resolve("Music"), home.resolve("Downloads"))
+        return buildList {
+            add(home.resolve("Music"))
+            add(home.resolve("Downloads"))
+            add(DesktopDownloadManager.defaultDirectory())
+            DesktopDownloadManager.fallbackDefaultDirectory()?.let(::add)
+        }.map { it.toAbsolutePath().normalize() }.distinct()
     }
 
     /** The folder the listener picked, or null for all of them. */
@@ -103,6 +108,11 @@ object DesktopLocalMusic {
     private const val MIN_MUSIC_BYTES = 240L * 1024
 
     internal const val KEY_FILTER_NON_MUSIC_AUDIO = "filter_non_music_audio"
+
+    internal fun isSupportedAudioExtension(extension: String): Boolean =
+        extension.lowercase(Locale.ROOT) in supportedExtensions
+
+    internal fun songFromFile(path: Path): Song = path.toSong()
 
     private fun Path.toSong(): Song {
         val absolutePath = toAbsolutePath().normalize()

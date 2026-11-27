@@ -30,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DragHandle
+import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Public
@@ -87,7 +88,7 @@ internal fun DesktopPlaylistDialog(
     error: String?,
     onPickAccount: (UserPlaylist) -> Unit,
     onPickLocal: (DesktopPlaylist) -> Unit,
-    onCreate: (String, PlaylistPrivacy) -> Unit,
+    onCreate: (String, PlaylistPrivacy, Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var creating by remember { mutableStateOf(song == null) }
@@ -176,16 +177,17 @@ private fun NewPlaylistForm(
     signedIn: Boolean,
     busy: Boolean,
     error: String?,
-    onCreate: (String, PlaylistPrivacy) -> Unit,
+    onCreate: (String, PlaylistPrivacy, Boolean) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var privacy by remember { mutableStateOf(PlaylistPrivacy.PRIVATE) }
+    var saveLocal by remember(signedIn) { mutableStateOf(!signedIn) }
     val focusRequester = remember { FocusRequester() }
     // The form exists to be typed into; opening it already focused saves the click that would
     // otherwise always follow.
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
-    val submit = { if (name.isNotBlank() && !busy) onCreate(name.trim(), privacy) }
+    val submit = { if (name.isNotBlank() && !busy) onCreate(name.trim(), privacy, saveLocal) }
 
     Row(
         Modifier.fillMaxWidth().padding(start = if (onBack != null) 8.dp else 22.dp, end = 22.dp, top = 16.dp),
@@ -204,7 +206,11 @@ private fun NewPlaylistForm(
                 color = Color.White,
             )
             Text(
-                if (signedIn) "Saved to your YouTube Music account" else "Saved on this computer",
+                if (saveLocal) {
+                    "Saved locally in ${DesktopPlaylistStore.directoryLabel()}"
+                } else {
+                    "Saved to your YouTube Music account"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = DesktopSecondary,
             )
@@ -236,7 +242,7 @@ private fun NewPlaylistForm(
                 modifier = Modifier
                     .fillMaxWidth()
                     .focusRequester(focusRequester)
-                    .onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+                    .trackDesktopTypingFocus(),
             )
         }
         if (name.isNotEmpty()) {
@@ -250,13 +256,24 @@ private fun NewPlaylistForm(
     }
 
     if (signedIn) {
-        DialogSectionHeading("Who can see it")
+        DialogSectionHeading("Save to")
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 22.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            PlaylistPrivacy.entries.forEach { option ->
-                PrivacyPill(option.icon, option.label, option == privacy) { privacy = option }
+            PrivacyPill(Icons.Rounded.Public, "YouTube Music", !saveLocal) { saveLocal = false }
+            PrivacyPill(Icons.Rounded.Folder, "This computer", saveLocal) { saveLocal = true }
+        }
+        if (!saveLocal) {
+            Spacer(Modifier.height(10.dp))
+            DialogSectionHeading("Who can see it")
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 22.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                PlaylistPrivacy.entries.forEach { option ->
+                    PrivacyPill(option.icon, option.label, option == privacy) { privacy = option }
+                }
             }
         }
     }
@@ -312,7 +329,7 @@ internal fun DesktopRenamePlaylistDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .focusRequester(focusRequester)
-                    .onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+                    .trackDesktopTypingFocus(),
             )
         }
         DialogButtons(
@@ -360,6 +377,7 @@ internal fun DesktopDeletePlaylistDialog(
 @Composable
 internal fun DesktopReorderPlaylistDialog(
     browseId: String,
+    localSongs: List<Song>? = null,
     busy: Boolean,
     error: String?,
     onSave: (original: List<Song>, reordered: List<Song>) -> Unit,
@@ -367,7 +385,15 @@ internal fun DesktopReorderPlaylistDialog(
     /** The app's song menu, planted under the cursor by the host this list runs in. */
     songContextMenu: @Composable (Song, () -> Unit) -> Unit,
 ) {
-    val entries by produceState<UiState<List<Song>>>(UiState.Loading, browseId) {
+    val entries by produceState<UiState<List<Song>>>(
+        initialValue = localSongs?.let { UiState.Success(it) } ?: UiState.Loading,
+        browseId,
+        localSongs,
+    ) {
+        if (localSongs != null) {
+            value = UiState.Success(localSongs)
+            return@produceState
+        }
         value = DesktopSearchClient.playlistEntries(browseId).fold(
             onSuccess = { UiState.Success(it) },
             onFailure = { UiState.Error(it.message ?: "Could not load the playlist") },

@@ -187,8 +187,8 @@ internal fun DesktopSpotifyCanvasDialog(onDismiss: () -> Unit, onSaved: (String)
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
 
     fun save() {
-        DesktopSpotifyToken.setCookie(token.trim())
-        onSaved(token.trim())
+        val clean = DesktopSpotifyToken.setCookie(token)
+        onSaved(clean)
         onDismiss()
     }
 
@@ -493,7 +493,7 @@ private fun DialogField(
                 keyboardActions = KeyboardActions(onDone = { onSubmit() }),
                 modifier = modifier
                     .fillMaxWidth()
-                    .onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+                    .trackDesktopTypingFocus(),
             )
         }
         if (value.isNotEmpty() && enabled) {

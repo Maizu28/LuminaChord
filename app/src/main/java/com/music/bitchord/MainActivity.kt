@@ -8,6 +8,7 @@ import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.KeyEvent
 import android.view.View
 import android.widget.Toast
@@ -1129,6 +1130,12 @@ private fun BitChordApp(
         }
     }
     LaunchedEffect(localMusicFolderUri, filterNonMusicAudio) {
+        val migrated = Downloads.migrateLegacyDownloads(context)
+        if (migrated) {
+            viewModel.reloadLocalDetail("local:downloads")
+            viewModel.reloadLocalDetail("local:all")
+            viewModel.loadLibrarySongs()
+        }
         val open = topDetail?.browseId
         if (open == "local:all" || LocalGroups.folderOf(open) == "local:all") {
             viewModel.reloadLocalDetail(open!!)
@@ -1151,6 +1158,10 @@ private fun BitChordApp(
         controller = controller,
         localPlayer = localPlayer,
         localShuffleEnabled = localShuffleEnabled,
+        localLyrics = lyrics,
+        localLyricsSource = lyricsSource,
+        localLyricsChecked = lyricsChecked,
+        onToggleLikeSong = toggleLikeOf,
     )
     val usingDesktopOutput = desktopOverlay.usingDesktopOutput
     val desktopNowPlaying = desktopOverlay.desktopNowPlaying
@@ -2294,25 +2305,81 @@ private fun BitChordApp(
      * permission arrives as forty loose tracks.
      */
     var downloadPendingFrom by remember { mutableStateOf<DownloadTarget?>(null) }
+    val resumePendingDownloads: () -> Unit = {
+        val songs = downloadPending
+        val from = downloadPendingFrom
+        downloadPending = emptyList()
+        downloadPendingFrom = null
+        if (songs.isNotEmpty()) {
+            songs.forEach { Downloads.enqueue(context, it, from?.title) }
+            if (from != null) Downloads.markRequested(from.id, songs.map { it.videoId })
+        }
+    }
+    val runMigrationInBackground: () -> Unit = {
+        scope.launch {
+            if (Downloads.migrateLegacyDownloads(context)) {
+                viewModel.reloadLocalDetail("local:downloads")
+                viewModel.reloadLocalDetail("local:all")
+                viewModel.loadLibrarySongs()
+            }
+        }
+    }
     val notifyPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { /* Refusing costs the progress notification, not the download. */ }
     val storagePermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        val songs = downloadPending
-        val from = downloadPendingFrom
-        downloadPending = emptyList()
-        downloadPendingFrom = null
-        when {
-            songs.isEmpty() -> Unit
-            granted -> {
-                songs.forEach { Downloads.enqueue(context, it, from?.title) }
-                if (from != null) Downloads.markRequested(from.id, songs.map { it.videoId })
+        if (granted) {
+            runMigrationInBackground()
+            com.music.bitchord.data.spotify.LocalPlaylistStore.refreshFromStorage(context)
+            OfflinePlaylists.refreshFromStorage(context)
+            resumePendingDownloads()
+        } else {
+            downloadPending = emptyList()
+            downloadPendingFrom = null
+            Toast
+                .makeText(context, context.getString(R.string.storage_required_save), Toast.LENGTH_SHORT)
+                .show()
+        }
+    }
+    val allFilesPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        if (DownloadStore.hasWriteAccess(context) || com.music.bitchord.data.PlaylistStorage.hasWriteAccess(context)) {
+            runMigrationInBackground()
+            com.music.bitchord.data.spotify.LocalPlaylistStore.refreshFromStorage(context)
+            OfflinePlaylists.refreshFromStorage(context)
+            resumePendingDownloads()
+        } else {
+            downloadPending = emptyList()
+            downloadPendingFrom = null
+            Toast
+                .makeText(context, context.getString(R.string.all_files_permission_required_save), Toast.LENGTH_LONG)
+                .show()
+        }
+    }
+    fun ensurePlaylistStorageAccess() = launchPlaylistStorageAccess(context, allFilesPermission, storagePermission)
+    PlaylistStorageResumeSync(context)
+    val safWritePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { folder ->
+        if (folder != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    folder,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
             }
-            // The one case where refusing is fatal: below API 29 there is no
-            // other way to reach the Music folder.
-            else -> Toast
+            AppSettings.setLocalMusicFolderUri(folder.toString())
+        }
+        if (DownloadStore.hasWriteAccess(context)) {
+            runMigrationInBackground()
+            resumePendingDownloads()
+        } else {
+            downloadPending = emptyList()
+            downloadPendingFrom = null
+            Toast
                 .makeText(context, context.getString(R.string.storage_required_save), Toast.LENGTH_SHORT)
                 .show()
         }
@@ -2415,11 +2482,7 @@ private fun BitChordApp(
         val blocked = songs.isNotEmpty() && !AppSettings.downloadsAllowedNow &&
             songs.none { Downloads.servableFromCache(it.videoId) }
         if (songs.isNotEmpty() && !blocked) {
-            val needsStorage = AppSettings.exportDownloads.value && DownloadStore.needsLegacyPermission() &&
-                ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                ) != PackageManager.PERMISSION_GRANTED
+            val needsStorage = !DownloadStore.hasWriteAccess(context)
 
             // Asked for here rather than at launch because here is where it means
             // something: a download is the first thing this app does that the user
@@ -2436,7 +2499,20 @@ private fun BitChordApp(
             if (needsStorage) {
                 downloadPending = songs
                 downloadPendingFrom = from
-                storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                when {
+                    AppSettings.localMusicFolderUri.value.isNotBlank() -> safWritePicker.launch(null)
+                    DownloadStore.needsAllFilesPermission() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                        val pkgIntent = Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:${context.packageName}"),
+                        )
+                        val launched = runCatching { allFilesPermission.launch(pkgIntent) }.isSuccess
+                        if (!launched) {
+                            allFilesPermission.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                        }
+                    }
+                    else -> storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                }
             } else {
                 songs.forEach { Downloads.enqueue(context, it, from?.title) }
                 if (from != null) Downloads.markRequested(from.id, songs.map { it.videoId })
@@ -5184,123 +5260,46 @@ private fun BitChordApp(
         // playlists with a way to make another. `creatingPlaylist` opens it
         // straight onto the form, which is what the Library tile means.
         if (playlistTarget != null || creatingPlaylist) {
-            val target = playlistTarget
-            val dismiss = {
-                playlistTarget = null
-                creatingPlaylist = false
-            }
-            PlaylistPickerSheet(
+            LocalOrAccountPlaylistPickerSheet(
+                context = context,
+                signedIn = signedIn,
                 playlists = playlists,
-                loading = playlistsLoading,
-                song = target,
-                startCreating = target == null,
-                onDismiss = dismiss,
-                onAdd = { picked ->
-                    target?.let { song ->
-                        viewModel.addToPlaylists(picked, song) { added, alreadyThere, failed ->
-                            // One line for the whole batch, saying the outcome
-                            // that matters most: what went in, else that it was
-                            // all there already, else that it didn't work.
-                            showQueueNotice(
-                                when {
-                                    added > 1 -> context.resources.getQuantityString(
-                                        R.plurals.added_to_playlists_notice, added, added,
-                                    )
-                                    added == 1 -> context.getString(R.string.song_added_to_playlist)
-                                    alreadyThere > 0 && failed == 0 ->
-                                        context.getString(R.string.song_already_in_playlist)
-                                    else -> context.getString(R.string.failed)
-                                },
-                            )
-                        }
-                    }
+                playlistsLoading = playlistsLoading,
+                localPlaylists = localPlaylists,
+                target = playlistTarget,
+                viewModel = viewModel,
+                onDismiss = {
+                    playlistTarget = null
+                    creatingPlaylist = false
                 },
-                onCreate = { title, privacy ->
-                    viewModel.createPlaylist(title, privacy, target)
-                },
+                onRequestStorageAccess = ::ensurePlaylistStorageAccess,
+                onNotice = showQueueNotice,
             )
         }
 
         albumPlaylistTarget?.let { target ->
-            PlaylistPickerSheet(
+            AlbumPlaylistPickerModal(
+                context = context,
                 playlists = playlists,
-                loading = playlistsLoading,
-                song = target.songs.firstOrNull(),
-                headerTitle = target.title,
+                playlistsLoading = playlistsLoading,
+                target = target,
+                viewModel = viewModel,
                 onDismiss = { albumPlaylistTarget = null },
-                onAdd = { picked ->
-                    viewModel.addSongsToPlaylists(picked, target.songs) { added, alreadyThere, failed ->
-                        showQueueNotice(
-                            when {
-                                added > 0 -> context.getString(R.string.song_added_to_playlist)
-                                alreadyThere > 0 && failed == 0 -> context.getString(R.string.song_already_in_playlist)
-                                else -> context.getString(R.string.failed)
-                            },
-                        )
-                    }
-                },
-                onCreate = { title, privacy ->
-                    viewModel.createPlaylistWithVideoIds(
-                        title = title,
-                        privacy = privacy,
-                        videoIds = target.songs.map { it.videoId },
-                        songs = target.songs,
-                    )
-                },
+                onNotice = showQueueNotice,
             )
         }
 
-        // ---- Add to a device playlist / new device playlist ----
-        // The sheet above over the offline player's own playlists, for a track
-        // that is a file on this device. Nothing here waits on a network, so
-        // there is no loading state and the outcome is known on the tap.
         if (offlinePlaylistTarget != null || creatingOfflinePlaylist) {
-            val target = offlinePlaylistTarget
-            val dismiss = {
-                offlinePlaylistTarget = null
-                creatingOfflinePlaylist = false
-            }
-            val choices = remember(offlinePlaylists) {
-                offlinePlaylists.map { playlist ->
-                    UserPlaylist(
-                        playlistId = playlist.id,
-                        title = playlist.title,
-                        subtitle = context.resources.getQuantityString(
-                            R.plurals.song_count_plural,
-                            playlist.songs.size,
-                            playlist.songs.size,
-                        ),
-                        thumbnailUrl = playlist.songs.firstNotNullOfOrNull { it.thumbnailUrl }
-                            .takeUnless { playlist.isLiked },
-                    )
-                }
-            }
-            PlaylistPickerSheet(
-                playlists = choices,
-                loading = false,
-                song = target,
-                startCreating = target == null,
-                offline = true,
-                onDismiss = dismiss,
-                onAdd = { picked ->
-                    target?.let { song ->
-                        val result = OfflinePlaylists.add(picked.mapTo(HashSet()) { it.playlistId }, listOf(song))
-                        showQueueNotice(
-                            when {
-                                result.added > 1 -> context.resources.getQuantityString(
-                                    R.plurals.added_to_playlists_notice, result.added, result.added,
-                                )
-                                result.added == 1 -> context.getString(R.string.song_added_to_playlist)
-                                result.alreadyThere > 0 -> context.getString(R.string.song_already_in_playlist)
-                                else -> context.getString(R.string.failed)
-                            },
-                        )
-                    }
+            OfflinePlaylistPickerModal(
+                context = context,
+                offlinePlaylists = offlinePlaylists,
+                target = offlinePlaylistTarget,
+                onDismiss = {
+                    offlinePlaylistTarget = null
+                    creatingOfflinePlaylist = false
                 },
-                onCreate = { title, _ ->
-                    OfflinePlaylists.create(title, listOfNotNull(target))
-                    if (target != null) showQueueNotice(context.getString(R.string.song_added_to_playlist))
-                },
+                onRequestStorageAccess = ::ensurePlaylistStorageAccess,
+                onNotice = showQueueNotice,
             )
         }
 
@@ -6576,6 +6575,223 @@ private const val PLAYER_SCRIM_ALPHA = 0.32f
  */
 @Composable
 private fun Isolated(content: @Composable () -> Unit) = content()
+
+private fun launchPlaylistStorageAccess(
+    context: Context,
+    allFilesPermission: androidx.activity.result.ActivityResultLauncher<Intent>,
+    storagePermission: androidx.activity.result.ActivityResultLauncher<String>,
+) {
+    if (com.music.bitchord.data.PlaylistStorage.hasWriteAccess(context)) return
+    if (com.music.bitchord.data.PlaylistStorage.needsAllFilesPermission() &&
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+    ) {
+        val pkgIntent = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:${context.packageName}"),
+        )
+        val launched = runCatching { allFilesPermission.launch(pkgIntent) }.isSuccess
+        if (!launched) {
+            allFilesPermission.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+        }
+    } else {
+        storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    }
+}
+
+@Composable
+private fun PlaylistStorageResumeSync(context: Context) {
+    val resumeLifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(resumeLifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                com.music.bitchord.data.spotify.LocalPlaylistStore.refreshFromStorage(context)
+                OfflinePlaylists.refreshFromStorage(context)
+            }
+        }
+        resumeLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { resumeLifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+}
+
+@Composable
+private fun LocalOrAccountPlaylistPickerSheet(
+    context: Context,
+    signedIn: Boolean,
+    playlists: List<UserPlaylist>,
+    playlistsLoading: Boolean,
+    localPlaylists: List<com.music.bitchord.data.spotify.LocalPlaylist>,
+    target: Song?,
+    viewModel: MainViewModel,
+    onDismiss: () -> Unit,
+    onRequestStorageAccess: () -> Unit,
+    onNotice: (String) -> Unit,
+) {
+    val localPlaylistChoices = remember(localPlaylists) {
+        localPlaylists.map { pl ->
+            UserPlaylist(
+                playlistId = pl.browseId,
+                title = pl.title,
+                subtitle = context.getString(R.string.local_playlist_subtitle, pl.songs.size),
+                thumbnailUrl = pl.songs.firstOrNull { !it.thumbnailUrl.isNullOrBlank() }?.thumbnailUrl,
+            )
+        }
+    }
+    val combinedPlaylists = remember(signedIn, playlists, localPlaylistChoices) {
+        if (signedIn) playlists + localPlaylistChoices else localPlaylistChoices
+    }
+    PlaylistPickerSheet(
+        playlists = combinedPlaylists,
+        loading = signedIn && playlistsLoading,
+        song = target,
+        startCreating = target == null,
+        signedIn = signedIn,
+        localSavePathLabel = com.music.bitchord.data.PlaylistStorage.DEFAULT_PUBLIC_PATH_LABEL,
+        onDismiss = onDismiss,
+        onAdd = { picked ->
+            target?.let { song ->
+                val localPicked = picked.filter { it.playlistId.startsWith("local:playlist:") }
+                val accountPicked = picked.filterNot { it.playlistId.startsWith("local:playlist:") }
+                var localAdded = 0
+                var localAlready = 0
+                for (choice in localPicked) {
+                    val count = com.music.bitchord.data.spotify.LocalPlaylistStore.addSongs(choice.playlistId, listOf(song))
+                    if (count > 0) localAdded++ else localAlready++
+                }
+                if (localPicked.isNotEmpty()) onRequestStorageAccess()
+                if (accountPicked.isNotEmpty()) {
+                    viewModel.addToPlaylists(accountPicked, song) { added, alreadyThere, failed ->
+                        val totalAdded = added + localAdded
+                        val totalAlready = alreadyThere + localAlready
+                        onNotice(
+                            when {
+                                totalAdded > 1 -> context.resources.getQuantityString(
+                                    R.plurals.added_to_playlists_notice, totalAdded, totalAdded,
+                                )
+                                totalAdded == 1 -> context.getString(R.string.song_added_to_playlist)
+                                totalAlready > 0 && failed == 0 ->
+                                    context.getString(R.string.song_already_in_playlist)
+                                else -> context.getString(R.string.failed)
+                            },
+                        )
+                    }
+                } else if (localPicked.isNotEmpty()) {
+                    onNotice(
+                        when {
+                            localAdded > 1 -> context.resources.getQuantityString(
+                                R.plurals.added_to_playlists_notice, localAdded, localAdded,
+                            )
+                            localAdded == 1 -> context.getString(R.string.song_added_to_playlist)
+                            localAlready > 0 -> context.getString(R.string.song_already_in_playlist)
+                            else -> context.getString(R.string.failed)
+                        },
+                    )
+                }
+            }
+        },
+        onCreate = { title, privacy ->
+            viewModel.createPlaylist(title, privacy, target)
+            if (!signedIn) onRequestStorageAccess()
+        },
+        onCreateLocal = { title ->
+            com.music.bitchord.data.spotify.LocalPlaylistStore.savePlaylist(title, listOfNotNull(target))
+            onRequestStorageAccess()
+            if (target != null) onNotice(context.getString(R.string.song_added_to_playlist))
+        },
+    )
+}
+
+@Composable
+private fun AlbumPlaylistPickerModal(
+    context: Context,
+    playlists: List<UserPlaylist>,
+    playlistsLoading: Boolean,
+    target: BrowseTarget,
+    viewModel: MainViewModel,
+    onDismiss: () -> Unit,
+    onNotice: (String) -> Unit,
+) {
+    PlaylistPickerSheet(
+        playlists = playlists,
+        loading = playlistsLoading,
+        song = target.songs.firstOrNull(),
+        headerTitle = target.title,
+        onDismiss = onDismiss,
+        onAdd = { picked ->
+            viewModel.addSongsToPlaylists(picked, target.songs) { added, alreadyThere, failed ->
+                onNotice(
+                    when {
+                        added > 0 -> context.getString(R.string.song_added_to_playlist)
+                        alreadyThere > 0 && failed == 0 -> context.getString(R.string.song_already_in_playlist)
+                        else -> context.getString(R.string.failed)
+                    },
+                )
+            }
+        },
+        onCreate = { title, privacy ->
+            viewModel.createPlaylistWithVideoIds(
+                title = title,
+                privacy = privacy,
+                videoIds = target.songs.map { it.videoId },
+                songs = target.songs,
+            )
+        },
+    )
+}
+
+@Composable
+private fun OfflinePlaylistPickerModal(
+    context: Context,
+    offlinePlaylists: List<com.music.bitchord.data.OfflinePlaylist>,
+    target: Song?,
+    onDismiss: () -> Unit,
+    onRequestStorageAccess: () -> Unit,
+    onNotice: (String) -> Unit,
+) {
+    val choices = remember(offlinePlaylists) {
+        offlinePlaylists.map { playlist ->
+            UserPlaylist(
+                playlistId = playlist.id,
+                title = playlist.title,
+                subtitle = context.resources.getQuantityString(
+                    R.plurals.song_count_plural,
+                    playlist.songs.size,
+                    playlist.songs.size,
+                ),
+                thumbnailUrl = playlist.songs.firstNotNullOfOrNull { it.thumbnailUrl }
+                    .takeUnless { playlist.isLiked },
+            )
+        }
+    }
+    PlaylistPickerSheet(
+        playlists = choices,
+        loading = false,
+        song = target,
+        startCreating = target == null,
+        offline = true,
+        onDismiss = onDismiss,
+        onAdd = { picked ->
+            target?.let { song ->
+                val result = OfflinePlaylists.add(picked.mapTo(HashSet()) { it.playlistId }, listOf(song))
+                onRequestStorageAccess()
+                onNotice(
+                    when {
+                        result.added > 1 -> context.resources.getQuantityString(
+                            R.plurals.added_to_playlists_notice, result.added, result.added,
+                        )
+                        result.added == 1 -> context.getString(R.string.song_added_to_playlist)
+                        result.alreadyThere > 0 -> context.getString(R.string.song_already_in_playlist)
+                        else -> context.getString(R.string.failed)
+                    },
+                )
+            }
+        },
+        onCreate = { title, _ ->
+            OfflinePlaylists.create(title, listOfNotNull(target))
+            onRequestStorageAccess()
+            if (target != null) onNotice(context.getString(R.string.song_added_to_playlist))
+        },
+    )
+}
 
 /** Longer than the ⋯ menu's exit, so its panel keeps its frost on the way out. */
 private const val SNAPSHOT_RELEASE_DELAY_MS = 400L

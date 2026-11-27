@@ -1579,4 +1579,12 @@
     <string name="drive_backup_row_subtitle">Cadangkan dan sinkronkan Replay di semua perangkat Anda</string>
     <string name="drive_over_cellular">Sinkronkan lewat data seluler</string>
     <string name="drive_over_cellular_subtitle">Jika nonaktif, sinkronisasi otomatis menunggu Wi-Fi</string>
+    <string name="download_format">Format unduhan</string>
+    <string name="download_format_dialog_subtitle">Lagu FLAC lossless tetap dipertahankan jika tersedia; lagu lainnya disimpan ke format pilihan.</string>
+    <string name="download_format_mp3_detail">Kompatibel di semua perangkat, HP &amp; audio mobil</string>
+    <string name="download_format_webm_detail">Audio Opus efisien dalam wadah WebM</string>
+    <string name="download_folder">Folder unduhan</string>
+    <string name="download_folder_all_subtitle">/storage/emulated/0/LuminaChord/Music (mengikuti Musik Lokal)</string>
+    <string name="download_folder_custom_subtitle">%1$s · Dipakai juga untuk lagu yang diunduh</string>
+    <string name="all_files_permission_required_save">Izinkan Akses semua file atau pilih Folder musik lokal agar unduhan tersimpan di luar folder Data aplikasi.</string>
 </resources>

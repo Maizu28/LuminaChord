@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 
 /**
  * A playlist of files on this device, made in the Local Music folder's
@@ -54,8 +55,12 @@ object OfflinePlaylists {
 
     private const val PREF_NAME = "bitchord_offline_playlists"
     private const val KEY_PLAYLISTS = "playlists_json"
+    private const val KEY_FOLDER_MIGRATED = "playlists_folder_migrated_v1"
 
     private lateinit var prefs: SharedPreferences
+    private var appContext: Context? = null
+    private var overrideDirectory: File? = null
+    private var overrideWriteAccess: Boolean? = null
     private val lock = Any()
     private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -73,8 +78,9 @@ object OfflinePlaylists {
     fun init(context: Context, likedTitle: String) {
         if (this::prefs.isInitialized) return
         this.likedTitle = likedTitle
-        prefs = context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        publish(load())
+        appContext = context.applicationContext
+        prefs = appContext!!.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        synchronized(lock) { publish(loadFromSources()) }
         // Everything after what was just read, however soon it comes: a like
         // made before this collector is up is still the newest state when it is.
         val loaded = _playlists.value
@@ -82,6 +88,35 @@ object OfflinePlaylists {
             playlists.filter { it !== loaded }.conflate().collect { persist(it) }
         }
     }
+
+    internal fun initForTest(
+        preferences: SharedPreferences,
+        directory: File?,
+        writeAccess: Boolean = directory != null,
+        likedTitle: String = "Liked songs",
+    ) {
+        this.likedTitle = likedTitle
+        appContext = null
+        overrideDirectory = directory
+        overrideWriteAccess = writeAccess
+        prefs = preferences
+        synchronized(lock) { publish(loadFromSources()) }
+    }
+
+    fun refreshFromStorage(context: Context? = appContext) {
+        if (context != null) appContext = context.applicationContext
+        if (!this::prefs.isInitialized && overrideWriteAccess == null) return
+        synchronized(lock) { publish(loadFromSources()) }
+    }
+
+    private fun canWriteFolder(): Boolean {
+        overrideWriteAccess?.let { return it }
+        val ctx = appContext ?: return false
+        return PlaylistStorage.hasWriteAccess(ctx)
+    }
+
+    private fun activeDirectory(): File =
+        overrideDirectory ?: PlaylistStorage.defaultPublicDirectory()
 
     fun isOfflinePlaylist(browseId: String?): Boolean = browseId?.startsWith(PREFIX) == true
 
@@ -168,6 +203,43 @@ object OfflinePlaylists {
         mutate { list -> list.filterNot { it.id == id } }
     }
 
+    fun mergeFromSync(incoming: List<OfflinePlaylist>): Int {
+        if (incoming.isEmpty()) return 0
+        var mergedCount = 0
+        mutate { list ->
+            val updated = list.toMutableList()
+            for (inList in incoming) {
+                if (inList.isLiked) continue
+                val cleanTitle = inList.title.trim()
+                if (cleanTitle.isEmpty()) continue
+                val validSongs = inList.songs.filter { !it.localUri.isNullOrBlank() || !it.localPath.isNullOrBlank() }
+                val existingIdx = updated.indexOfFirst {
+                    !it.isLiked && (it.id == inList.id || it.title.trim().equals(cleanTitle, ignoreCase = true))
+                }
+                if (existingIdx >= 0) {
+                    val existing = updated[existingIdx]
+                    val seenUris = existing.songs.mapNotNullTo(HashSet()) { it.localUri ?: it.localPath }
+                    val seenTitles = existing.songs.mapTo(HashSet()) { "${it.title.lowercase()}|${it.artist.lowercase()}" }
+                    val fresh = validSongs.filter { song ->
+                        val key = song.localUri ?: song.localPath
+                        val uniqueKey = key == null || seenUris.add(key)
+                        val uniqueTitle = seenTitles.add("${song.title.lowercase()}|${song.artist.lowercase()}")
+                        uniqueKey && uniqueTitle
+                    }.map { it.stored() }
+                    if (fresh.isNotEmpty()) {
+                        updated[existingIdx] = existing.copy(songs = existing.songs + fresh)
+                        mergedCount++
+                    }
+                } else {
+                    updated.add(inList.copy(songs = validSongs.map { it.stored() }))
+                    mergedCount++
+                }
+            }
+            updated
+        }
+        return mergedCount
+    }
+
     private inline fun mutate(change: (List<OfflinePlaylist>) -> List<OfflinePlaylist>) {
         synchronized(lock) { publish(change(_playlists.value)) }
     }
@@ -201,7 +273,42 @@ object OfflinePlaylists {
         trackNumber = trackNumber,
     )
 
-    private fun load(): List<OfflinePlaylist> {
+    private fun loadFromSources(): List<OfflinePlaylist> {
+        val prefsList = loadFromPrefs()
+        if (!canWriteFolder()) return prefsList
+
+        val dir = activeDirectory()
+        val diskUser = PlaylistStorage.readDirectory(dir, PlaylistStorage.KIND_OFFLINE)
+            .filterNot { it.id == LIKED_ID }
+            .map { OfflinePlaylist(id = it.id, title = it.title, songs = it.songs) }
+
+        val liked = prefsList.firstOrNull { it.isLiked }
+        val migratedAlready = this::prefs.isInitialized && prefs.getBoolean(KEY_FOLDER_MIGRATED, false)
+        if (!migratedAlready) {
+            val prefsUser = prefsList.filterNot { it.isLiked }
+            val unmigrated = prefsUser.filter { legacy ->
+                diskUser.none { existing ->
+                    existing.id == legacy.id || existing.title.trim().equals(legacy.title.trim(), ignoreCase = true)
+                }
+            }
+            val mergedUser = if (unmigrated.isNotEmpty()) {
+                val combined = diskUser + unmigrated
+                saveUserPlaylistsToDirectory(combined)
+                combined
+            } else {
+                if (!dir.exists()) dir.mkdirs()
+                diskUser
+            }
+            if (this::prefs.isInitialized) {
+                prefs.edit().putBoolean(KEY_FOLDER_MIGRATED, true).apply()
+            }
+            return listOfNotNull(liked) + mergedUser
+        }
+        return listOfNotNull(liked) + diskUser
+    }
+
+    private fun loadFromPrefs(): List<OfflinePlaylist> {
+        if (!this::prefs.isInitialized) return emptyList()
         val raw = prefs.getString(KEY_PLAYLISTS, null) ?: return emptyList()
         return runCatching {
             val array = JSONArray(raw)
@@ -220,58 +327,48 @@ object OfflinePlaylists {
         }
     }
 
-    private fun persist(list: List<OfflinePlaylist>) {
-        runCatching {
-            val array = JSONArray()
-            list.forEach { playlist ->
-                val songs = JSONArray()
-                playlist.songs.forEach { songs.put(it.toJson()) }
-                array.put(
-                    JSONObject()
-                        .put("id", playlist.id)
-                        .put("title", playlist.title)
-                        .put("songs", songs),
-                )
+    internal fun persist(list: List<OfflinePlaylist>) {
+        if (this::prefs.isInitialized) {
+            runCatching {
+                val array = JSONArray()
+                list.forEach { playlist ->
+                    val songs = JSONArray()
+                    playlist.songs.forEach { songs.put(it.toJson()) }
+                    array.put(
+                        JSONObject()
+                            .put("id", playlist.id)
+                            .put("title", playlist.title)
+                            .put("songs", songs),
+                    )
+                }
+                prefs.edit().putString(KEY_PLAYLISTS, array.toString()).apply()
+            }.onFailure { DebugLog.w("BitChord", "Offline playlists not saved: ${it.message}") }
+        }
+        if (canWriteFolder()) {
+            if (saveUserPlaylistsToDirectory(list.filterNot { it.isLiked }) && this::prefs.isInitialized) {
+                prefs.edit().putBoolean(KEY_FOLDER_MIGRATED, true).apply()
             }
-            prefs.edit().putString(KEY_PLAYLISTS, array.toString()).apply()
-        }.onFailure { DebugLog.w("BitChord", "Offline playlists not saved: ${it.message}") }
+        }
     }
 
-    private fun Song.toJson(): JSONObject = JSONObject().apply {
-        put("videoId", videoId)
-        put("title", title)
-        put("artist", artist)
-        putOpt("thumbnailUrl", thumbnailUrl)
-        putOpt("durationText", durationText)
-        putOpt("artistId", artistId)
-        putOpt("albumId", albumId)
-        putOpt("albumName", albumName)
-        putOpt("localUri", localUri)
-        putOpt("localPath", localPath)
-        localDateAddedSeconds?.let { put("added", it) }
-        localDateModifiedSeconds?.let { put("modified", it) }
-        trackNumber?.let { put("track", it) }
-    }
-
-    private fun songFrom(obj: JSONObject): Song? {
-        fun JSONObject.text(key: String): String? = if (isNull(key)) null else optString(key).takeIf { it.isNotEmpty() }
-        val uri = obj.text("localUri") ?: return null
-        return Song(
-            videoId = obj.text("videoId") ?: uri,
-            title = obj.optString("title"),
-            artist = obj.optString("artist"),
-            thumbnailUrl = obj.text("thumbnailUrl"),
-            durationText = obj.text("durationText"),
-            artistId = obj.text("artistId"),
-            albumId = obj.text("albumId"),
-            albumName = obj.text("albumName"),
-            localUri = uri,
-            localPath = obj.text("localPath"),
-            localDateAddedSeconds = if (obj.has("added")) obj.getLong("added") else null,
-            localDateModifiedSeconds = if (obj.has("modified")) obj.getLong("modified") else null,
-            trackNumber = if (obj.has("track")) obj.getInt("track") else null,
+    private fun saveUserPlaylistsToDirectory(userPlaylists: List<OfflinePlaylist>): Boolean =
+        PlaylistStorage.saveKind(
+            playlists = userPlaylists.mapIndexed { idx, pl ->
+                StoredPlaylist(
+                    id = pl.id,
+                    title = pl.title,
+                    kind = PlaylistStorage.KIND_OFFLINE,
+                    sortOrder = idx,
+                    songs = pl.songs,
+                )
+            },
+            kind = PlaylistStorage.KIND_OFFLINE,
+            directory = activeDirectory(),
         )
-    }
+
+    private fun Song.toJson(): JSONObject = PlaylistStorage.songToJson(this)
+
+    private fun songFrom(obj: JSONObject): Song? = PlaylistStorage.songFromJson(obj)
 }
 
 /**

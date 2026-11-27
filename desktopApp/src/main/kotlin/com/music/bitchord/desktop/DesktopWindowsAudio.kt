@@ -69,6 +69,18 @@ internal object DesktopWindowsAudio {
         }.getOrNull()
     }
 
+    /** Current Windows system hardware master volume scalar (0f..1f), or null when unavailable. */
+    fun masterVolume(): Float? {
+        if (!available) return null
+        return runCatching { nativeGetMasterVolume().takeIf { it in 0f..1f } }.getOrNull()
+    }
+
+    /** Sets the Windows system hardware master volume scalar (0f..1f) and unmutes when > 0. */
+    fun setMasterVolume(volume: Float): Boolean {
+        if (!available) return false
+        return runCatching { nativeSetMasterVolume(volume.coerceIn(0f, 1f)) }.getOrDefault(false)
+    }
+
     /** Called from the native side when an endpoint is added, removed, enabled or disabled. */
     @JvmStatic
     fun onDevicesChanged() = DesktopAudioDevices.systemChanged()
@@ -91,6 +103,8 @@ internal object DesktopWindowsAudio {
     @JvmStatic private external fun nativeClose()
     @JvmStatic private external fun nativeDeviceName(): String
     @JvmStatic private external fun nativeLastError(): String
+    @JvmStatic private external fun nativeGetMasterVolume(): Float
+    @JvmStatic private external fun nativeSetMasterVolume(volume: Float): Boolean
 
     private const val LIBRARY = "bitchord_window"
 }

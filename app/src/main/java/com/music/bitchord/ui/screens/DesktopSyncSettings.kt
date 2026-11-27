@@ -43,7 +43,6 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
-import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -100,15 +99,17 @@ internal fun DesktopSyncSettingsRow(onClick: () -> Unit) {
     val context = LocalContext.current
     LaunchedEffect(Unit) { DesktopSyncManager.init(context) }
     val status by DesktopSyncManager.status.collectAsStateWithLifecycle()
+    val syncEnabled by DesktopSyncManager.syncEnabled.collectAsStateWithLifecycle()
 
     SettingsRow(
         icon = SfIcons.Desktop,
         title = stringResource(R.string.desktop_sync_section),
-        value = when (status) {
-            is DesktopSyncStatus.Connected -> stringResource(R.string.desktop_sync_status_connected)
-            is DesktopSyncStatus.Searching -> stringResource(R.string.desktop_sync_status_searching)
-            is DesktopSyncStatus.Connecting -> stringResource(R.string.desktop_sync_status_searching)
-            DesktopSyncStatus.Disconnected -> stringResource(R.string.desktop_sync_status_disconnected)
+        value = when {
+            !syncEnabled -> "Nonaktif"
+            status is DesktopSyncStatus.Connected -> stringResource(R.string.desktop_sync_status_connected)
+            status is DesktopSyncStatus.Searching -> stringResource(R.string.desktop_sync_status_searching)
+            status is DesktopSyncStatus.Connecting -> stringResource(R.string.desktop_sync_status_searching)
+            else -> stringResource(R.string.desktop_sync_status_disconnected)
         },
         onClick = onClick,
     )
@@ -160,6 +161,47 @@ fun DesktopSyncScreen(contentPadding: PaddingValues, modifier: Modifier = Modifi
         if (isGranted) {
             DesktopSyncManager.mergeLocalMusicWithDesktop(context, twoWay = true)
         }
+    }
+
+    val playlistAllFilesLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) {
+        com.music.bitchord.data.spotify.LocalPlaylistStore.refreshFromStorage(context)
+        com.music.bitchord.data.OfflinePlaylists.refreshFromStorage(context)
+        DesktopSyncManager.syncNow(context)
+    }
+
+    val playlistWritePermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) {
+        com.music.bitchord.data.spotify.LocalPlaylistStore.refreshFromStorage(context)
+        com.music.bitchord.data.OfflinePlaylists.refreshFromStorage(context)
+        DesktopSyncManager.syncNow(context)
+    }
+
+    fun startPlaylistAwareSync() {
+        if (syncPlaylists && !com.music.bitchord.data.PlaylistStorage.hasWriteAccess(context)) {
+            if (com.music.bitchord.data.PlaylistStorage.needsAllFilesPermission() &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+            ) {
+                val intent = android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    android.net.Uri.parse("package:${context.packageName}"),
+                )
+                val launched = runCatching { playlistAllFilesLauncher.launch(intent) }.isSuccess
+                if (!launched) {
+                    runCatching {
+                        playlistAllFilesLauncher.launch(
+                            android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                        )
+                    }.onFailure { DesktopSyncManager.syncNow(context) }
+                }
+            } else {
+                playlistWritePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+            return
+        }
+        DesktopSyncManager.syncNow(context)
     }
 
     fun startLocalMusicMerge() {
@@ -239,13 +281,27 @@ fun DesktopSyncScreen(contentPadding: PaddingValues, modifier: Modifier = Modifi
 
             RowDivider()
 
+            val syncEnabled by DesktopSyncManager.syncEnabled.collectAsStateWithLifecycle()
+
             SettingsSubRow(
-                title = stringResource(R.string.desktop_sync_auto_discover),
-                subtitle = stringResource(R.string.desktop_sync_auto_discover_sub),
+                title = "Aktifkan LuminaChord Sync",
+                subtitle = "Pairing & sinkronisasi otomatis dengan LuminaChord Desktop",
+                checked = syncEnabled,
+                onCheckedChange = { enabled ->
+                    DesktopSyncManager.setSyncEnabled(enabled)
+                },
+            )
+
+            RowDivider()
+
+            SettingsSubRow(
+                title = "Pairing Otomatis via Wi-Fi",
+                subtitle = "Terhubung otomatis saat berada di jaringan Wi-Fi yang sama",
                 checked = autoDiscover,
+                enabled = syncEnabled,
                 onCheckedChange = { enabled ->
                     DesktopSyncManager.setAutoDiscover(enabled)
-                    if (enabled && status is DesktopSyncStatus.Disconnected) {
+                    if (enabled && syncEnabled && status is DesktopSyncStatus.Disconnected) {
                         DesktopSyncManager.autoDiscover()
                     }
                 },
@@ -255,35 +311,18 @@ fun DesktopSyncScreen(contentPadding: PaddingValues, modifier: Modifier = Modifi
 
             SettingsRow(
                 icon = Icons.Rounded.Search,
-                title = "Cari PC Otomatis (Wi-Fi / USB)",
-                subtitle = "Pindai jaringan Wi-Fi lokal atau terowongan USB ADB secara otomatis",
+                title = "Cari PC Otomatis (Wi-Fi)",
+                subtitle = "Pindai jaringan Wi-Fi lokal secara otomatis",
                 trailing = {
                     ActionPill(
                         text = "Cari PC",
-                        onClick = { DesktopSyncManager.autoDiscover() },
-                    )
-                },
-                onClick = { DesktopSyncManager.autoDiscover() },
-            )
-
-            RowDivider()
-
-            SettingsRow(
-                icon = Icons.Rounded.Usb,
-                title = "Hubungkan via Kabel USB (ADB Reverse)",
-                subtitle = "Tanpa Wi-Fi: colok kabel USB & aktifkan USB Tunnel di PC (127.0.0.1)",
-                trailing = {
-                    ActionPill(
-                        text = "Via USB",
                         onClick = {
-                            val p = inputPort.toIntOrNull() ?: 8688
-                            DesktopSyncManager.connectUsbAdb(p, inputCode)
+                            if (syncEnabled) DesktopSyncManager.autoDiscover()
                         },
                     )
                 },
                 onClick = {
-                    val p = inputPort.toIntOrNull() ?: 8688
-                    DesktopSyncManager.connectUsbAdb(p, inputCode)
+                    if (syncEnabled) DesktopSyncManager.autoDiscover()
                 },
             )
 
@@ -711,7 +750,7 @@ fun DesktopSyncScreen(contentPadding: PaddingValues, modifier: Modifier = Modifi
         SettingsGroup(header = stringResource(R.string.desktop_sync_options_header)) {
             SettingsSubRow(
                 title = stringResource(R.string.desktop_sync_playlists),
-                subtitle = stringResource(R.string.desktop_sync_playlists_sub),
+                subtitle = "${stringResource(R.string.desktop_sync_playlists_sub)} · ${com.music.bitchord.data.PlaylistStorage.DEFAULT_PUBLIC_PATH_LABEL}",
                 checked = syncPlaylists,
                 onCheckedChange = DesktopSyncManager::setSyncPlaylists,
             )
@@ -770,7 +809,7 @@ fun DesktopSyncScreen(contentPadding: PaddingValues, modifier: Modifier = Modifi
             PrimaryButton(
                 text = if (isSyncing) "Menyinkronkan…" else stringResource(R.string.desktop_sync_sync_now),
                 enabled = !isSyncing && status is DesktopSyncStatus.Connected,
-                onClick = { DesktopSyncManager.syncNow(context) },
+                onClick = ::startPlaylistAwareSync,
             )
 
             if (isSyncing) {

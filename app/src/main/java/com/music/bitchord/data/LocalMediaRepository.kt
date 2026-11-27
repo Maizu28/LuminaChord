@@ -50,6 +50,9 @@ object LocalMediaRepository {
 
     /** Check if storage/audio permission is granted to query device local music. */
     fun hasStoragePermission(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && android.os.Environment.isExternalStorageManager()) {
+            return true
+        }
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(
                 context,
@@ -64,24 +67,43 @@ object LocalMediaRepository {
     }
 
     /**
-     * Retrieves all songs in the `Music/BitChord` directory, combining app downloads
-     * with any local audio files present in that folder.
-     *
-     * The download record is the better source for a title and a credit — it
-     * holds what the catalogue row said, not what a scanner guessed off a
-     * filename — but it only started carrying the album at all recently, and
-     * an album page's rows never name their own release. So whatever the media
-     * scanner read off each file is collected alongside and used to fill the
-     * gaps, which is what keeps the Albums tab from being empty for everything
-     * downloaded before that field existed.
+     * Retrieves all downloaded songs, combining persistent records in [Downloads] with
+     * surviving audio files found on disk in `/storage/emulated/0/LuminaChord/Music` (and
+     * unmigrated legacy `Music/BitChord` files).
      */
     suspend fun getDownloadedSongs(context: Context): List<Song> = withContext(Dispatchers.IO) {
         val appDownloads = Downloads.getDownloadedSongs(context)
-        val knownUris = appDownloads.mapNotNull { it.localUri }.toSet()
+        val knownUris = appDownloads.mapNotNull { it.localUri }.toMutableSet()
+        val knownPaths = appDownloads.mapNotNull {
+            it.localUri?.takeIf { u -> u.startsWith("file://") }?.let { u -> Uri.parse(u).path }
+        }.toMutableSet()
         val extraSongs = mutableListOf<Song>()
 
         /** uri to what the media scanner read off that file. */
         val scanned = mutableMapOf<String, ScannedTags>()
+
+        // Direct filesystem scan of `/storage/emulated/0/LuminaChord/Music` finds `.webm` and `.mp3`
+        // tracks even after an app reinstall or when MediaStore omits `audio/webm`.
+        if (AppSettings.localMusicFolderUri.value.isBlank()) {
+            val publicDir = DownloadStore.defaultPublicDirectory()
+            if (publicDir.isDirectory) {
+                runCatching {
+                    publicDir.listFiles()?.forEach { file ->
+                        if (file.isFile && !file.name.startsWith('.') && isAudioFileName(file.name)) {
+                            val uriStr = Uri.fromFile(file).toString()
+                            val modified = file.lastModified().takeIf { it > 0L }?.div(1_000)
+                            val tags = ScannedTags(null, null, modified, modified)
+                            scanned[uriStr] = tags
+                            if (uriStr !in knownUris && file.absolutePath !in knownPaths) {
+                                knownUris += uriStr
+                                knownPaths += file.absolutePath
+                                extraSongs += buildSongFromUri(context, uriStr, file.name, tags)
+                            }
+                        }
+                    }
+                }.onFailure { Log.w(TAG, "Failed scanning ${publicDir.absolutePath}: ${it.message}") }
+            }
+        }
 
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -93,8 +115,8 @@ object LocalMediaRepository {
                     MediaStore.Audio.Media.DATE_ADDED,
                     MediaStore.Audio.Media.DATE_MODIFIED,
                 )
-                val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-                val selectionArgs = arrayOf("%${DownloadStore.FOLDER}%")
+                val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? OR ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+                val selectionArgs = arrayOf("%${DownloadStore.DEFAULT_PUBLIC_RELATIVE_PATH}%", "%${DownloadStore.FOLDER}%")
 
                 context.contentResolver.query(
                     MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
@@ -121,6 +143,7 @@ object LocalMediaRepository {
                         )
                         scanned[contentUri] = tags
                         if (contentUri !in knownUris && isAudioFileName(name)) {
+                            knownUris += contentUri
                             extraSongs.add(buildSongFromUri(context, contentUri, name, tags))
                         }
                     }
@@ -136,7 +159,7 @@ object LocalMediaRepository {
                     folder.listFiles()?.forEach { file ->
                         if (file.isFile && isAudioFileName(file.name)) {
                             val uriStr = Uri.fromFile(file).toString()
-                            if (uriStr !in knownUris) {
+                            if (uriStr !in knownUris && file.absolutePath !in knownPaths) {
                                 val modified = file.lastModified().takeIf { it > 0 }?.div(1_000)
                                 extraSongs.add(
                                     buildSongFromUri(
@@ -151,7 +174,7 @@ object LocalMediaRepository {
                     }
                 }
             }
-        }.onFailure { Log.w(TAG, "Failed scanning Music/BitChord directory: ${it.message}") }
+        }.onFailure { Log.w(TAG, "Failed scanning MediaStore downloads: ${it.message}") }
 
         val filled = appDownloads.map { song ->
             val uri = song.localUri ?: return@map song
@@ -242,6 +265,11 @@ object LocalMediaRepository {
         val sortOrder = "${MediaStore.Audio.Media.TITLE} ASC"
 
         runCatching {
+            val treeUri = AppSettings.localMusicFolderUri.value
+            val chosen = if (treeUri.isBlank()) null else selectedFolder(treeUri)
+            val seenPaths = HashSet<String>()
+            val seenNames = HashSet<String>()
+
             context.contentResolver.query(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
                 AUDIO_PROJECTION,
@@ -250,9 +278,6 @@ object LocalMediaRepository {
                 sortOrder,
             )?.use { cursor ->
                 val columns = AudioColumns(cursor)
-                // Parsed once for the scan rather than once per row.
-                val treeUri = AppSettings.localMusicFolderUri.value
-                val chosen = if (treeUri.isBlank()) null else selectedFolder(treeUri)
                 while (cursor.moveToNext()) {
                     val displayName = cursor.getString(columns.displayName).orEmpty()
                     val durationMs = cursor.getLong(columns.duration)
@@ -261,8 +286,45 @@ object LocalMediaRepository {
                     if (filterNonMusic && !isEligibleLocalMusic(durationMs, displayName, path)) continue
                     if (treeUri.isNotBlank() && !isInFolder(path, chosen)) continue
 
+                    path?.normalizedPath()?.let { seenPaths += it }
+                    displayName.takeIf { it.isNotBlank() }?.lowercase(Locale.ROOT)?.let { seenNames += it }
                     songs.add(columns.song(cursor, videoIdByUri))
                 }
+            }
+
+            // Include unindexed files (especially `.webm`) in the active download directory / SAF folder.
+            if (treeUri.isBlank()) {
+                val publicDir = DownloadStore.defaultPublicDirectory()
+                if (publicDir.isDirectory) {
+                    publicDir.listFiles()?.forEach { file ->
+                        if (!file.isFile || file.name.startsWith('.') || !isAudioFileName(file.name)) return@forEach
+                        val normPath = file.absolutePath.normalizedPath()
+                        if (normPath in seenPaths) return@forEach
+                        if (filterNonMusic && !isEligibleLocalMusic(0L, file.name, file.absolutePath)) return@forEach
+                        val uriStr = Uri.fromFile(file).toString()
+                        val modified = file.lastModified().takeIf { it > 0L }?.div(1_000)
+                        songs.add(
+                            buildSongFromUri(
+                                context,
+                                uriStr,
+                                file.name,
+                                ScannedTags(null, null, modified, modified),
+                            ).let { s ->
+                                val id = videoIdByUri[uriStr]
+                                if (id != null) s.copy(videoId = id) else s
+                            },
+                        )
+                    }
+                }
+            } else {
+                appendUnindexedTreeDocuments(
+                    context = context,
+                    treeUriString = treeUri,
+                    seenNames = seenNames,
+                    filterNonMusic = filterNonMusic,
+                    videoIdByUri = videoIdByUri,
+                    out = songs,
+                )
             }
         }.onFailure { Log.w(TAG, "Failed scanning device local music: ${it.message}") }
 
@@ -434,6 +496,8 @@ object LocalMediaRepository {
     /** Human-readable path for the folder setting without exposing provider internals. */
     fun selectedFolderLabel(treeUri: String): String? = selectedFolder(treeUri)?.label
 
+    fun selectedFolderAbsolutePath(treeUri: String): String? = selectedFolder(treeUri)?.rawPath
+
     internal fun isInSelectedFolder(path: String?, treeUri: String): Boolean {
         if (treeUri.isBlank()) return true
         return isInFolder(path, selectedFolder(treeUri))
@@ -445,13 +509,17 @@ object LocalMediaRepository {
         return candidate == folder.absolutePath || candidate.startsWith("${folder.absolutePath}/")
     }
 
-    private data class SelectedFolder(val absolutePath: String, val label: String)
+    private data class SelectedFolder(
+        val absolutePath: String,
+        val rawPath: String,
+        val label: String,
+    )
 
     private fun selectedFolder(treeUri: String): SelectedFolder? = runCatching {
         val documentId = DocumentsContract.getTreeDocumentId(Uri.parse(treeUri))
         if (documentId.startsWith("raw:")) {
-            val path = documentId.removePrefix("raw:").normalizedPath()
-            return@runCatching SelectedFolder(path, path.substringAfterLast('/'))
+            val raw = documentId.removePrefix("raw:").replace('\\', '/').trimEnd('/')
+            return@runCatching SelectedFolder(raw.normalizedPath(), raw, raw.substringAfterLast('/'))
         }
         val volume = documentId.substringBefore(':')
         val relative = documentId.substringAfter(':', "").trim('/')
@@ -460,11 +528,60 @@ object LocalMediaRepository {
         } else {
             "/storage/$volume"
         }
+        val raw = listOf(volumeRoot, relative).filter { it.isNotBlank() }.joinToString("/")
         SelectedFolder(
-            absolutePath = listOf(volumeRoot, relative).filter { it.isNotBlank() }.joinToString("/").normalizedPath(),
+            absolutePath = raw.normalizedPath(),
+            rawPath = raw,
             label = relative.ifBlank { volume },
         )
     }.getOrNull()
+
+    private fun appendUnindexedTreeDocuments(
+        context: Context,
+        treeUriString: String,
+        seenNames: HashSet<String>,
+        filterNonMusic: Boolean,
+        videoIdByUri: Map<String, String>,
+        out: MutableList<Song>,
+    ) {
+        val treeUri = runCatching { Uri.parse(treeUriString) }.getOrNull() ?: return
+        val parentDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull() ?: return
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+        runCatching {
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val modCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                if (idCol < 0 || nameCol < 0) return@use
+                while (cursor.moveToNext()) {
+                    val name = cursor.getString(nameCol) ?: continue
+                    if (name.startsWith('.') || !isAudioFileName(name)) continue
+                    if (name.lowercase(Locale.ROOT) in seenNames) continue
+                    if (filterNonMusic && !isEligibleLocalMusic(0L, name, null)) continue
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(idCol)).toString()
+                    val modified = if (modCol >= 0 && !cursor.isNull(modCol)) {
+                        cursor.getLong(modCol).takeIf { it > 0L }?.div(1_000)
+                    } else null
+                    val song = buildSongFromUri(
+                        context,
+                        docUri,
+                        name,
+                        ScannedTags(null, null, modified, modified),
+                    ).let { s ->
+                        val knownId = videoIdByUri[docUri]
+                        if (knownId != null) s.copy(videoId = knownId) else s
+                    }
+                    out += song
+                    seenNames += name.lowercase(Locale.ROOT)
+                }
+            }
+        }
+    }
 
     private fun String.normalizedPath(): String =
         replace('\\', '/').trimEnd('/').lowercase(Locale.ROOT)

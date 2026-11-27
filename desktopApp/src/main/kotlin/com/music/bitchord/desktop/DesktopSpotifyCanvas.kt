@@ -19,11 +19,20 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Duration
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import javafx.application.Platform
+import javafx.concurrent.Worker
+import javafx.scene.web.WebEngine
+import javafx.scene.web.WebView
+import netscape.javascript.JSObject
 
 /**
  * Spotify's Canvas: the short looping clip shown behind a track in their own app.
@@ -329,8 +338,13 @@ private fun ByteArrayOutputStream.writeVarint(value: Long) {
 internal object DesktopSpotifyToken {
 
     private const val TOKEN_URL = "https://open.spotify.com/api/token"
+    private const val SERVER_TIME_URL = "https://open.spotify.com/api/server-time"
+    private const val WEBVIEW_BRIDGE = "BitChordSpotifyTokenBridge"
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private val BUNDLE_URL_REGEX = Regex("""https://open\.spotifycdn\.com/cdn/build/web-player/web-player\.[a-f0-9]+\.js""")
+    private val SECRET_SINGLE_REGEX = Regex("""secret:'((?:\\.|[^'])*)',\s*version:(\d+)""")
+    private val SECRET_DOUBLE_REGEX = Regex("""secret:"((?:\\.|[^"])*)",\s*version:(\d+)""")
 
     @Volatile private var cachedAccessToken: String? = null
     @Volatile private var accessTokenExpiresAtMs = 0L
@@ -338,17 +352,52 @@ internal object DesktopSpotifyToken {
     @Volatile private var cachedClientToken: String? = null
     @Volatile private var clientTokenExpiresAtMs = 0L
     @Volatile private var retryAfterMs = 0L
+    @Volatile private var forceWebViewNext = false
+    @Volatile private var dynamicSecrets: Map<Int, IntArray> = emptyMap()
     @Volatile private var session: Pair<String, String>? = null
 
-    /** The listener's `sp_dc` cookie. Nothing here works without it. */
-    fun cookie(): String = DesktopPersistence().string(KEY_SPDC).trim()
+    /** Sanitizes a user-pasted or captured `sp_dc` cookie value (strips prefix, quotes, attributes). */
+    internal fun sanitizeCookie(raw: String): String {
+        val trimmed = raw.trim().trim('"', '\'')
+        val withoutPrefix = if (trimmed.startsWith("sp_dc=", ignoreCase = true)) {
+            trimmed.substringAfter('=')
+        } else {
+            trimmed
+        }
+        return withoutPrefix.substringBefore(';').trim()
+    }
 
-    fun setCookie(value: String) {
-        DesktopPersistence().saveString(KEY_SPDC, value.trim())
+    /** The listener's `sp_dc` cookie. Nothing here works without it. */
+    fun cookie(): String = sanitizeCookie(DesktopPersistence().string(KEY_SPDC))
+
+    fun setCookie(value: String): String {
+        val clean = sanitizeCookie(value)
+        DesktopPersistence().saveString(KEY_SPDC, clean)
         cachedAccessToken = null
         accessTokenExpiresAtMs = 0L
+        cachedClientToken = null
+        clientTokenExpiresAtMs = 0L
+        cachedClientId = null
         retryAfterMs = 0L
+        forceWebViewNext = false
+        return clean
     }
+
+    @Synchronized
+    fun markTokenRejected() {
+        cachedAccessToken = null
+        accessTokenExpiresAtMs = 0L
+        cachedClientToken = null
+        clientTokenExpiresAtMs = 0L
+        retryAfterMs = 0L
+        forceWebViewNext = true
+    }
+
+    private data class MintedToken(
+        val accessToken: String,
+        val expiresAtMs: Long,
+        val clientId: String?,
+    )
 
     @Synchronized
     fun accessToken(): String? {
@@ -357,40 +406,239 @@ internal object DesktopSpotifyToken {
         cachedAccessToken?.let { if (now < accessTokenExpiresAtMs - 30_000) return it }
         if (now < retryAfterMs) return null
 
-        val secret = TOTP_SECRETS.maxByOrNull { it.key }
-        val code = secret?.let { totp(it.value, now / 1000) }
-        val query = buildList {
-            add("reason" to "init")
-            add("productType" to "web-player")
-            if (code != null && secret != null) {
-                add("totp" to code)
-                add("totpServer" to code)
-                add("totpVer" to secret.key.toString())
-            }
-        }.joinToString("&") { (name, value) -> "$name=${URLEncoder.encode(value, StandardCharsets.UTF_8)}" }
+        val minted = if (forceWebViewNext && DesktopPoTokenWebView.available) {
+            harvestViaWebView(cookie) ?: mintViaTotp(cookie, now)
+        } else {
+            mintViaTotp(cookie, now) ?: harvestViaWebView(cookie)
+        }
+
+        if (minted == null) {
+            retryAfterMs = now + RETRY_MS
+            DesktopTrackLog.log("spotify: could not mint an access token from sp_dc")
+            return null
+        }
+        forceWebViewNext = false
+        cachedAccessToken = minted.accessToken
+        accessTokenExpiresAtMs = minted.expiresAtMs
+        minted.clientId?.let { cachedClientId = it }
+        return minted.accessToken
+    }
+
+    private fun mintViaTotp(cookie: String, nowMs: Long): MintedToken? {
+        val localSec = nowMs / 1000L
+        val serverSec = fetchServerTimeSeconds() ?: localSec
+        val known = (TOTP_SECRETS + dynamicSecrets).entries
+            .sortedByDescending { it.key }
+            .map { it.key to it.value }
+
+        for ((ver, secret) in known) {
+            requestTokenWithTotp(cookie, ver, secret, localSec, serverSec)?.let { return it }
+        }
+
+        // Known secret versions rejected by Spotify (rotation) — extract the live secret from Spotify's bundle.
+        val refreshed = refreshDynamicSecrets()
+        for ((ver, secret) in refreshed.entries.sortedByDescending { it.key }) {
+            if (ver in TOTP_SECRETS || ver in dynamicSecrets) continue
+            requestTokenWithTotp(cookie, ver, secret, localSec, serverSec)?.let { return it }
+        }
+        return null
+    }
+
+    private fun requestTokenWithTotp(
+        cookie: String,
+        ver: Int,
+        secret: IntArray,
+        localSec: Long,
+        serverSec: Long,
+    ): MintedToken? {
+        val codeLocal = totp(secret, localSec) ?: return null
+        val codeServer = totp(secret, serverSec) ?: codeLocal
+        val query = listOf(
+            "reason" to "init",
+            "productType" to "web-player",
+            "totp" to codeLocal,
+            "totpServer" to codeServer,
+            "totpVer" to ver.toString(),
+        ).joinToString("&") { (name, value) -> "$name=${URLEncoder.encode(value, StandardCharsets.UTF_8)}" }
 
         val body = canvasGet(
             "$TOKEN_URL?$query",
             mapOf(
                 "Cookie" to "sp_dc=$cookie",
                 "Referer" to "https://open.spotify.com/",
+                "Origin" to "https://open.spotify.com",
                 "App-Platform" to "WebPlayer",
             ),
-        )
-        val root = body?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
-        val token = root?.get("accessToken")?.jsonPrimitive?.contentOrNull
-        if (token.isNullOrBlank()) {
-            // Backed off rather than retried per track: if Spotify has changed the shape, asking on
-            // every skip fixes nothing and makes every canvas lookup pay for the round trip.
-            retryAfterMs = now + RETRY_MS
-            DesktopTrackLog.log("canvas: Spotify would not mint an access token")
-            return null
+        ) ?: return null
+        return parseTokenResponse(body, allowAnonymous = false)
+    }
+
+    private fun parseTokenResponse(body: String, allowAnonymous: Boolean): MintedToken? {
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
+        val isAnon = root["isAnonymous"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+        if (isAnon && !allowAnonymous) return null
+        val token = root["accessToken"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return null
+        val expiresAt = root["accessTokenExpirationTimestampMs"]
+            ?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+            ?.takeIf { it > System.currentTimeMillis() }
+            ?: (System.currentTimeMillis() + 3_600_000L)
+        val clientId = root["clientId"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        return MintedToken(token, expiresAt, clientId)
+    }
+
+    private fun fetchServerTimeSeconds(): Long? {
+        val body = canvasGet(
+            SERVER_TIME_URL,
+            mapOf("Referer" to "https://open.spotify.com/"),
+        ) ?: return null
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
+        return root["serverTime"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+    }
+
+    private fun refreshDynamicSecrets(): Map<Int, IntArray> {
+        val html = canvasGet("https://open.spotify.com/") ?: return emptyMap()
+        val bundleUrl = BUNDLE_URL_REGEX.find(html)?.value ?: return emptyMap()
+        val js = canvasGet(bundleUrl) ?: return emptyMap()
+        val parsed = parseSecretsFromBundleJs(js)
+        if (parsed.isNotEmpty()) {
+            dynamicSecrets = dynamicSecrets + parsed
         }
-        cachedAccessToken = token
-        accessTokenExpiresAtMs = root["accessTokenExpirationTimestampMs"]
-            ?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: (now + 3_600_000)
-        cachedClientId = root["clientId"]?.jsonPrimitive?.contentOrNull
-        return token
+        return parsed
+    }
+
+    internal fun parseSecretsFromBundleJs(js: String): Map<Int, IntArray> {
+        val found = linkedMapOf<Int, IntArray>()
+        for (regex in listOf(SECRET_SINGLE_REGEX, SECRET_DOUBLE_REGEX)) {
+            for (match in regex.findAll(js)) {
+                val raw = unescapeJsString(match.groupValues[1])
+                val ver = match.groupValues[2].toIntOrNull() ?: continue
+                if (raw.isNotEmpty()) {
+                    found[ver] = raw.map { it.code }.toIntArray()
+                }
+            }
+        }
+        return found
+    }
+
+    private fun unescapeJsString(s: String): String {
+        val sb = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '\\' && i + 1 < s.length) {
+                val next = s[i + 1]
+                when (next) {
+                    '\\', '\'', '"' -> { sb.append(next); i += 2; continue }
+                    'n' -> { sb.append('\n'); i += 2; continue }
+                    'r' -> { sb.append('\r'); i += 2; continue }
+                    't' -> { sb.append('\t'); i += 2; continue }
+                }
+            }
+            sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
+
+    class WebViewTokenBridge(private val result: CompletableFuture<String?>) {
+        fun onTokenPayload(payload: String?) {
+            if (payload.isNullOrBlank() || result.isDone) return
+            if (parseTokenResponse(payload, allowAnonymous = false) != null) {
+                result.complete(payload)
+            }
+        }
+    }
+
+    private val HOOK_SCRIPT = """
+        (function () {
+          if (window.__bitchordTokenHook) return;
+          window.__bitchordTokenHook = true;
+          var report = function (body) {
+            try { if (window.$WEBVIEW_BRIDGE) window.$WEBVIEW_BRIDGE.onTokenPayload(body); } catch (e) {}
+          };
+          var isToken = function (u) {
+            try { return String(u).indexOf('/api/token') !== -1; } catch (e) { return false; }
+          };
+          var origFetch = window.fetch;
+          if (origFetch) {
+            window.fetch = function (input, init) {
+              var url = (input && input.url) ? input.url : input;
+              var res = origFetch.apply(this, arguments);
+              if (isToken(url)) {
+                try { res.then(function (r) { r.clone().text().then(report).catch(function () {}); }).catch(function () {}); } catch (e) {}
+              }
+              return res;
+            };
+          }
+          var origOpen = XMLHttpRequest.prototype.open;
+          XMLHttpRequest.prototype.open = function (method, url) {
+            this.__bitchordUrl = url;
+            return origOpen.apply(this, arguments);
+          };
+          var origSend = XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.send = function () {
+            var xhr = this;
+            try {
+              xhr.addEventListener('load', function () {
+                if (isToken(xhr.__bitchordUrl)) report(xhr.responseText);
+              });
+            } catch (e) {}
+            return origSend.apply(this, arguments);
+          };
+        })();
+    """.trimIndent()
+
+    private fun harvestViaWebView(cookie: String): MintedToken? {
+        if (!DesktopPoTokenWebView.available) return null
+        val future = CompletableFuture<String?>()
+        var holderView: WebView? = null
+        var storageDir: Path? = null
+        val bridge = WebViewTokenBridge(future)
+
+        runCatching {
+            val cookieHeaders = mapOf("Set-Cookie" to listOf("sp_dc=$cookie; Domain=.spotify.com; Path=/; Secure"))
+            DesktopWebCookies.put(URI("https://open.spotify.com/"), cookieHeaders)
+            DesktopWebCookies.put(URI("https://accounts.spotify.com/"), cookieHeaders)
+        }
+
+        Platform.runLater {
+            runCatching {
+                val folder = Files.createTempDirectory("luminachord-spotify-token-").also { storageDir = it }
+                val webView = WebView().also { holderView = it }
+                val engine: WebEngine = webView.engine
+                engine.userDataDirectory = folder.toFile()
+                fun installHook() {
+                    runCatching {
+                        val win = engine.executeScript("window") as? JSObject ?: return
+                        win.setMember(WEBVIEW_BRIDGE, bridge)
+                        engine.executeScript(HOOK_SCRIPT)
+                    }
+                }
+                engine.documentProperty().addListener { _, _, doc -> if (doc != null) installHook() }
+                engine.loadWorker.stateProperty().addListener { _, _, state ->
+                    if (state == Worker.State.RUNNING || state == Worker.State.SUCCEEDED) installHook()
+                    if (state == Worker.State.FAILED && !future.isDone) future.complete(null)
+                }
+                engine.load("https://open.spotify.com/")
+            }.onFailure {
+                if (!future.isDone) future.complete(null)
+            }
+        }
+
+        return try {
+            val raw = future.get(15, TimeUnit.SECONDS) ?: return null
+            parseTokenResponse(raw, allowAnonymous = false)
+        } catch (_: Exception) {
+            null
+        } finally {
+            Platform.runLater {
+                runCatching {
+                    holderView?.engine?.load("about:blank")
+                    holderView = null
+                    storageDir?.toFile()?.deleteRecursively()
+                }
+            }
+        }
     }
 
     /**
@@ -403,6 +651,11 @@ internal object DesktopSpotifyToken {
         cachedClientToken?.let { if (now < clientTokenExpiresAtMs - 30_000) return it }
         val clientId = cachedClientId ?: return null
         val (clientVersion, deviceId) = session() ?: return null
+        val osName = when {
+            DesktopPlatform.isWindows -> "windows"
+            DesktopPlatform.isMac -> "macos"
+            else -> "linux"
+        }
 
         val payload = buildJsonObject {
             putJsonObject("client_data") {
@@ -411,7 +664,7 @@ internal object DesktopSpotifyToken {
                 putJsonObject("js_sdk_data") {
                     put("device_brand", "unknown")
                     put("device_model", "unknown")
-                    put("os", "linux")
+                    put("os", osName)
                     put("os_version", System.getProperty("os.version").orEmpty())
                     put("device_id", deviceId)
                     put("device_type", "computer")
@@ -480,16 +733,16 @@ internal object DesktopSpotifyToken {
     }.getOrNull()
 
     /**
-     * The secrets the web player has shipped, newest last.
-     *
-     * Kept as a table rather than scraped: the bundle's shape changes more often than the secret
-     * does, and an unknown version simply means the request goes out unsigned.
+     * Fallback TOTP secrets shipped by Spotify Web Player. Kept updated + auto-refreshed from the live
+     * JS bundle via [refreshDynamicSecrets] when Spotify rotates the version.
      */
     private val TOTP_SECRETS: Map<Int, IntArray> = mapOf(
-        12 to intArrayOf(107, 81, 49, 57, 67, 93, 87, 81, 69, 67, 40, 93, 48, 50, 46, 91, 94, 113, 41, 47),
+        61 to """,7/*F("rLJ2oxaKL^f+E1xvP@N""".map { it.code }.toIntArray(),
+        60 to """OmE{ZA.J^":0FG\Uz?[@WW""".map { it.code }.toIntArray(),
+        59 to """{iOFn;4}<1PFYKPV?5{%u14]M>/V0hDH""".map { it.code }.toIntArray(),
     )
 
-    private const val RETRY_MS = 30L * 60 * 1000
+    private const val RETRY_MS = 10_000L
 
     internal const val KEY_SPDC = "spotify_spdc_token"
 }

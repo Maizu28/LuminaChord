@@ -73,7 +73,7 @@ Beyond the core [BitChord](https://github.com/kushagrasinghx/BitChord) codebase,
 - **Spotify playlist & Liked Songs import**.
 - **Discord Rich Presence** with live track metadata and progress.
 - **Scrobbling** to **Last.fm** and **ListenBrainz**.
-- **Multi-module Kotlin architecture**: Android (`:app`), Desktop (`:desktopApp`), Android TV (`:tv`), and Wear OS (`:wearos`).
+- **Multi-module Kotlin architecture**: actively maintained and tested on **Android Mobile** (`:app`) and **Windows Desktop** (`:desktopApp`); upstream `:tv` (Android TV) and `:wearos` (Wear OS) source modules remain untouched and untested.
 
     </td>
     <td width="50%" valign="top">
@@ -94,9 +94,11 @@ Beyond the core [BitChord](https://github.com/kushagrasinghx/BitChord) codebase,
 ## <a id="download--build"></a>Download & Build
 
 ### Releases
-Pre-built Android APKs and Windows installers for this fork are published on the [**LuminaChord Releases**](https://github.com/Maizu28/LuminaChord/releases) page:
-- **Android**: `app-prod-arm64-v8a-debug/release.apk` or `universal` APK
+Pre-built builds published for this fork focus on actively tested targets only:
+- **Android Mobile**: `app-prod-arm64-v8a-*.apk` or `universal` APK
 - **Windows (x64)**: `LuminaChord-Windows-x64-Setup.exe`
+
+Available on the [**LuminaChord Releases**](https://github.com/Maizu28/LuminaChord/releases) page. *(Upstream `:tv` Android TV and `:wearos` Wear OS modules are left untouched from BitChord and are not tested or released in this fork.)*
 
 *(Looking for the original upstream releases? Visit [**kushagrasinghx/BitChord Releases**](https://github.com/kushagrasinghx/BitChord/releases).)*
 

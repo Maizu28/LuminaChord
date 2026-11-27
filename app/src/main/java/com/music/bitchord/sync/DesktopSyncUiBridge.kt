@@ -14,17 +14,23 @@ import androidx.media3.session.MediaController
 import com.music.bitchord.data.listentogether.ListenTogether
 import com.music.bitchord.data.lyrics.LyricLine
 import com.music.bitchord.data.lyrics.LyricsSource
+import com.music.bitchord.data.model.PlaybackSourceType
 import com.music.bitchord.data.model.QueueEntryIdentity
+import com.music.bitchord.data.model.QueueTier
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.durationMillis
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.playback.PlayerState
+import com.music.bitchord.playback.QueueCoordinator
+import com.music.bitchord.playback.QueueCoordinator.asQueueEntry
 import com.music.bitchord.playback.QueueShuffle
+import com.music.bitchord.playback.QueueSource
 import com.music.bitchord.playback.clearUserQueueWithUndo
 import com.music.bitchord.playback.playSongs
 import com.music.bitchord.playback.removeQueueEntriesWithUndo
 import com.music.bitchord.playback.removeQueueItemWithUndo
 import com.music.bitchord.playback.replayFromHistory
+import com.music.bitchord.playback.toMediaItem
 import com.music.bitchord.playback.toSong
 import com.music.bitchord.ui.LyricsProviderState
 import kotlinx.coroutines.CoroutineScope
@@ -53,6 +59,10 @@ fun rememberDesktopOverlayState(
     controller: MediaController?,
     localPlayer: PlayerState,
     localShuffleEnabled: Boolean,
+    localLyrics: List<LyricLine>? = null,
+    localLyricsSource: LyricsSource? = null,
+    localLyricsChecked: Boolean = false,
+    onToggleLikeSong: ((Song) -> Unit)? = null,
 ): DesktopOverlayState {
     val context = LocalContext.current
     LaunchedEffect(Unit) { DesktopSyncManager.init(context) }
@@ -100,9 +110,29 @@ fun rememberDesktopOverlayState(
 
     val audioMgr = remember(context) { context.getSystemService(AudioManager::class.java) }
     val bridgeScope = rememberCoroutineScope()
-    DisposableEffect(controller, audioMgr, bridgeScope) {
-        DesktopSyncManager.mobileBridge = createMobilePlaybackBridge(controller, audioMgr, bridgeScope)
+    DisposableEffect(controller, audioMgr, bridgeScope, onToggleLikeSong) {
+        DesktopSyncManager.mobileBridge = createMobilePlaybackBridge(controller, audioMgr, bridgeScope, onToggleLikeSong)
         onDispose { DesktopSyncManager.mobileBridge = null }
+    }
+
+    LaunchedEffect(
+        desktopSyncStatus,
+        usingDesktopOutput,
+        localPlayer.song?.videoId,
+        localLyrics,
+        localLyricsSource,
+        localLyricsChecked,
+    ) {
+        if (!usingDesktopOutput) {
+            val activeSong = localPlayer.song
+            DesktopSyncManager.updateMobileLyrics(
+                videoId = activeSong?.videoId.orEmpty(),
+                lines = localLyrics.orEmpty(),
+                source = localLyricsSource?.label,
+                loading = !localLyricsChecked && activeSong != null,
+                unavailable = localLyricsChecked && localLyrics.isNullOrEmpty(),
+            )
+        }
     }
 
     LaunchedEffect(
@@ -136,6 +166,7 @@ private fun createMobilePlaybackBridge(
     controller: MediaController?,
     audioMgr: AudioManager?,
     bridgeScope: CoroutineScope,
+    onToggleLikeSong: ((Song) -> Unit)? = null,
 ): MobilePlaybackBridge = object : MobilePlaybackBridge {
     override suspend fun currentPlaybackSnapshot(): MobilePlaybackSnapshot? =
         withContext(Dispatchers.Main.immediate) {
@@ -164,6 +195,73 @@ private fun createMobilePlaybackBridge(
         bridgeScope.launch(Dispatchers.Main.immediate) {
             val c = controller ?: return@launch
             if (c.isConnected) c.pause()
+        }
+    }
+
+    override fun playFromDesktop(songs: List<Song>, startIndex: Int, isOneOff: Boolean, isPlaying: Boolean) {
+        if (songs.isEmpty()) return
+        bridgeScope.launch(Dispatchers.Main.immediate) {
+            val c = controller ?: return@launch
+            if (!c.isConnected) return@launch
+            val currentTimeline = (0 until c.mediaItemCount).map { idx -> c.getMediaItemAt(idx).toSong() }
+            val currentIndex = c.currentMediaItemIndex
+            val first = songs.getOrNull(startIndex) ?: songs.first()
+            val source = QueueSource(
+                title = first.playbackSource ?: first.albumName ?: "Desktop",
+                type = first.playbackSourceType ?: PlaybackSourceType.QUEUE,
+                id = first.playbackSourceId,
+            )
+            if (isOneOff) {
+                val queue = QueueCoordinator.buildOneOffQueue(
+                    currentTimeline = currentTimeline,
+                    currentIndex = currentIndex,
+                    tappedSong = first,
+                    source = source,
+                )
+                c.playSongs(
+                    songs = queue,
+                    startIndex = 0,
+                    startPositionMs = 0L,
+                    playWhenReady = isPlaying,
+                    preserveOrder = true,
+                )
+            } else {
+                val built = QueueCoordinator.buildContextQueue(
+                    currentTimeline = currentTimeline,
+                    currentIndex = currentIndex,
+                    newContextSongs = songs,
+                    selectedIndex = startIndex.coerceIn(songs.indices),
+                    contextSource = source,
+                )
+                c.playSongs(
+                    songs = built.timeline,
+                    startIndex = built.startIndex,
+                    startPositionMs = 0L,
+                    playWhenReady = isPlaying,
+                    preserveOrder = false,
+                )
+            }
+        }
+    }
+
+    override fun enqueueFromDesktop(song: Song, playNext: Boolean) {
+        bridgeScope.launch(Dispatchers.Main.immediate) {
+            val c = controller ?: return@launch
+            if (!c.isConnected) return@launch
+            val current = c.currentMediaItem?.toSong()
+            val timeline = (0 until c.mediaItemCount).map { idx -> c.getMediaItemAt(idx).toSong() }
+            val at = QueueCoordinator.findUserQueueInsertionIndex(
+                timeline = timeline,
+                currentIndex = c.currentMediaItemIndex,
+                isNext = playNext,
+            )
+            val queued = song.copy(
+                radioName = current?.radioName,
+                playbackSource = current?.playbackSource ?: song.playbackSource ?: "Queue",
+                playbackSourceType = current?.playbackSourceType ?: PlaybackSourceType.QUEUE,
+                playbackSourceId = current?.playbackSourceId,
+            ).asQueueEntry(QueueTier.USER_QUEUE)
+            c.addMediaItem(at, queued.toMediaItem())
         }
     }
 
@@ -197,7 +295,16 @@ private fun createMobilePlaybackBridge(
         }
     }
 
-    override fun applyRemoteCommandFromDesktop(action: String, value: String?, positionMs: Long?) {
+    override fun applyRemoteCommandFromDesktop(
+        action: String,
+        value: String?,
+        positionMs: Long?,
+        index: Int?,
+        from: Int?,
+        to: Int?,
+        shuffle: Boolean?,
+        repeatMode: Int?,
+    ) {
         bridgeScope.launch(Dispatchers.Main.immediate) {
             val c = controller ?: return@launch
             if (!c.isConnected) return@launch
@@ -216,12 +323,49 @@ private fun createMobilePlaybackBridge(
                     val maxVol = audioMgr?.getStreamMaxVolume(AudioManager.STREAM_MUSIC)?.coerceAtLeast(1) ?: 15
                     audioMgr?.setStreamVolume(AudioManager.STREAM_MUSIC, (v * maxVol).roundToInt(), 0)
                 }
+                "toggle_shuffle" -> QueueShuffle.toggle(c)
+                "set_shuffle" -> {
+                    val want = shuffle ?: value?.toBooleanStrictOrNull() ?: return@launch
+                    if (QueueShuffle.enabled.value != want) QueueShuffle.toggle(c)
+                }
+                "cycle_repeat" -> {
+                    val next = when (c.repeatMode) {
+                        Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                        Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                        else -> Player.REPEAT_MODE_OFF
+                    }
+                    AppSettings.setRepeatMode(next)
+                    c.repeatMode = next
+                }
+                "set_repeat" -> {
+                    val next = (repeatMode ?: value?.toIntOrNull())?.coerceIn(0, 2) ?: return@launch
+                    AppSettings.setRepeatMode(next)
+                    c.repeatMode = next
+                }
                 "jump_queue" -> {
-                    val idx = value?.toIntOrNull() ?: return@launch
+                    val idx = index ?: value?.toIntOrNull() ?: return@launch
                     if (idx in 0 until c.mediaItemCount) {
                         c.seekTo(idx, 0L)
                         c.play()
                     }
+                }
+                "remove_queue" -> {
+                    val idx = index ?: value?.toIntOrNull() ?: return@launch
+                    if (idx in 0 until c.mediaItemCount && idx != c.currentMediaItemIndex) {
+                        c.removeMediaItem(idx)
+                    }
+                }
+                "move_queue" -> {
+                    val fromIdx = from ?: return@launch
+                    val toIdx = to ?: return@launch
+                    if (fromIdx in 0 until c.mediaItemCount && toIdx in 0 until c.mediaItemCount && fromIdx != toIdx) {
+                        c.moveMediaItem(fromIdx, toIdx)
+                    }
+                }
+                "clear_queue" -> c.clearUserQueueWithUndo()
+                "toggle_like" -> {
+                    val song = c.currentMediaItem?.toSong() ?: return@launch
+                    onToggleLikeSong?.invoke(song)
                 }
             }
         }

@@ -515,14 +515,14 @@ private fun DesktopLyricsSearchForm(
             onValueChange = { title = it },
             label = { Text(DesktopStrings["d_song_title", "Song title"]) },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth().onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+            modifier = Modifier.fillMaxWidth().trackDesktopTypingFocus(),
         )
         OutlinedTextField(
             value = artist,
             onValueChange = { artist = it },
             label = { Text(DesktopStrings["d_song_artists", "Song artists"]) },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth().onFocusChanged { DesktopShortcutSettings.isTypingActive = it.isFocused },
+            modifier = Modifier.fillMaxWidth().trackDesktopTypingFocus(),
         )
         Row(
             Modifier.fillMaxWidth(),

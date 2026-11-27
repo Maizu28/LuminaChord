@@ -16,6 +16,8 @@ import androidx.media3.session.SessionToken
 import com.music.bitchord.playback.ACTION_TOGGLE_FAVORITE
 import com.music.bitchord.playback.ACTION_TOGGLE_SHUFFLE
 import com.music.bitchord.playback.PlaybackService
+import com.music.bitchord.sync.DesktopSyncManager
+import com.music.bitchord.sync.DesktopSyncStatus
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -37,6 +39,18 @@ class MediaWidgetActions : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action?.takeIf { it in ACTIONS } ?: return
         val app = context.applicationContext
+        if (DesktopSyncManager.desktopOutputActive.value && DesktopSyncManager.status.value is DesktopSyncStatus.Connected) {
+            when (action) {
+                ACTION_TOGGLE -> DesktopSyncManager.sendRemoteCommand("play_pause")
+                ACTION_NEXT -> DesktopSyncManager.sendRemoteCommand("next")
+                ACTION_PREVIOUS -> DesktopSyncManager.sendRemoteCommand("previous")
+                ACTION_TOGGLE_FAVORITE -> DesktopSyncManager.desktopNowPlaying.value?.videoId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { DesktopSyncManager.toggleLikeOnDesktop(it) }
+                ACTION_TOGGLE_SHUFFLE -> DesktopSyncManager.toggleShuffleOnDesktop()
+            }
+            return
+        }
 
         // Held open across the connect: a controller that arrives after the
         // broadcast has returned arrives in a process that may already be gone.

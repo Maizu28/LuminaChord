@@ -1,16 +1,20 @@
 package com.music.bitchord.download
 
-import android.content.ContentValues
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
+import androidx.core.content.ContextCompat
+import com.music.bitchord.R
 import com.music.bitchord.data.DebugLog as Log
-import com.music.bitchord.data.settings.AppSettings
-import androidx.annotation.RequiresApi
+import com.music.bitchord.data.LocalMediaRepository
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.settings.AppSettings
 import java.io.File
 import java.io.OutputStream
 import java.util.Locale
@@ -18,71 +22,69 @@ import java.util.Locale
 /**
  * Where a downloaded track goes, and how it gets there.
  *
- * The destination is the device's own Music folder, in a `BitChord`
- * subfolder — somewhere the file manager lists, other players can open, and a
- * user can back up or delete without going through this app. That choice is
- * what makes this class necessary at all: an app-private directory would be
- * four lines of [File], but a shared one crosses the scoped-storage line and
- * the two sides of that line have nothing in common.
+ * Downloads save outside app-private data so songs survive app reinstalls and stay easy to find:
  *
- * It goes through the audio collection rather than Downloads because that is
- * where audio belongs and where every other player on the device looks. What
- * first ruled Downloads out was narrower and is worth keeping on the record:
- * the files were `.webm` then — a container extension Android's own mime table
- * ties to video regardless of what MIME type this class declares for it — and a
- * Gallery app crawling Downloads for video-looking files does not care what a
- * column says otherwise. Nothing writes `.webm` any more (see [storable] and
- * `StreamResolver.resolveForDownload`), so that particular trap is behind us;
- * the conclusion it led to is still the right one.
- *
- *  - **API 29+** goes through [MediaStore]. There is no filesystem path to
- *    write to; the store mints a row, hands back a content uri, and the file
- *    exists at a location it chooses. `IS_PENDING` keeps the row invisible to
- *    everything else until the bytes are all there, so a cancelled download is
- *    never a half-file somebody can find and play.
- *  - **API 26–28** is a real path and a runtime permission. The file is written
- *    beside its final name with a `.part` suffix and renamed on completion,
- *    which is the same guarantee `IS_PENDING` gives for free above, and the
- *    media scanner is told afterwards or the file stays invisible to everything
- *    that reads the index rather than the disk.
- *
- * Neither side writes tags — this class only ever copies the bytes the server
- * on the other end sent. [MediaTagger] rewrites the finished file afterwards to
- * add them; the filename below is what every downloaded track carries
- * regardless of whether that rewrite finds a layout it recognises.
+ *  - When **Local music folder** has been chosen via SAF, files are staged locally for
+ *    transcoding/tagging and committed directly into that picked folder via [DocumentsContract].
+ *  - When **Local music folder** is unset (`All audio folders`), files save directly to
+ *    `/storage/emulated/0/LuminaChord/Music` (and are scanned by `MediaScannerConnection`).
  */
 object DownloadStore {
 
     private const val TAG = "BitChord"
 
-    /** The subfolder of Music that everything lands in. */
+    /** Legacy subfolder kept for migrating older `Music/BitChord` downloads. */
     const val FOLDER = "BitChord"
 
-    private val relativePath = "${Environment.DIRECTORY_MUSIC}/$FOLDER"
+    /** Default public home subfolder used when Local Music is set to "All audio folders". */
+    const val DEFAULT_PUBLIC_RELATIVE_PATH = "LuminaChord/Music"
+    const val DEFAULT_PUBLIC_PATH_LABEL = "/storage/emulated/0/LuminaChord/Music"
 
-    /**
-     * Whether saving needs `WRITE_EXTERNAL_STORAGE` asked for at runtime.
-     *
-     * Only below API 29. From there on the app writes through the media store,
-     * which grants access to rows it created and needs no permission for them —
-     * and the permission it would ask for isn't grantable anyway.
-     *
-     * Every version check in this file is written out inline rather than
-     * routed through this, deliberately: lint reads an inline `SDK_INT`
-     * comparison as a guard around the API-29 calls beside it and does not
-     * read a boolean property the same way, so hiding the check behind a name
-     * costs a `NewApi` error on the release build.
-     */
-    fun needsLegacyPermission(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+    fun defaultPublicDirectory(): File =
+        File(Environment.getExternalStorageDirectory(), DEFAULT_PUBLIC_RELATIVE_PATH)
+
+    fun folderDisplayLabel(context: Context): String {
+        val treeUri = AppSettings.localMusicFolderUri.value
+        if (treeUri.isBlank()) return DEFAULT_PUBLIC_PATH_LABEL
+        return LocalMediaRepository.selectedFolderAbsolutePath(treeUri)
+            ?: LocalMediaRepository.selectedFolderLabel(treeUri)
+            ?: context.getString(R.string.local_music_folder)
+    }
+
+    /** Whether API <= 29 runtime `WRITE_EXTERNAL_STORAGE` should be requested instead of All Files Access. */
+    fun needsLegacyPermission(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.R
+
+    /** Whether Android 11+ `MANAGE_EXTERNAL_STORAGE` is required because default home storage is active. */
+    fun needsAllFilesPermission(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && AppSettings.localMusicFolderUri.value.isBlank()
+
+    fun hasWriteAccess(context: Context): Boolean {
+        val treeUri = AppSettings.localMusicFolderUri.value
+        if (treeUri.isNotBlank()) {
+            return hasTreeWritePermission(context, treeUri)
+        }
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    fun hasTreeWritePermission(context: Context, treeUriString: String): Boolean {
+        if (treeUriString.isBlank()) return false
+        val parsed = runCatching { Uri.parse(treeUriString) }.getOrNull() ?: return false
+        return context.contentResolver.persistedUriPermissions.any { perm ->
+            perm.uri == parsed && perm.isWritePermission
+        }
+    }
 
     // ---- Naming -------------------------------------------------------------
 
     /**
      * What the file is called: `Artist - Title.ext`.
-     *
-     * Artist first because a Music folder is sorted by name and nothing
-     * else — no tags to group by — so leading with the artist is the only thing
-     * that puts an album back together in the listing.
      */
     fun fileNameFor(song: Song, extension: String): String {
         val artist = sanitise(song.artist)
@@ -95,10 +97,6 @@ object DownloadStore {
         return "${stem.take(MAX_STEM_CHARS).trimEnd()}.$extension"
     }
 
-    /**
-     * Everything a FAT32 volume, the media store or a shell would each object
-     * to for its own reasons, plus the whitespace that survives them.
-     */
     private fun sanitise(raw: String): String = raw
         .replace(ILLEGAL, " ")
         .replace(WHITESPACE, " ")
@@ -107,35 +105,10 @@ object DownloadStore {
 
     private val ILLEGAL = Regex("""[\\/:*?"<>|\x00-\x1F]""")
     private val WHITESPACE = Regex("""\s+""")
-
-    /** Long enough for anything real, short of the 255-byte filename ceiling. */
     private const val MAX_STEM_CHARS = 120
 
-    /** What a file of some codec is called and what the store is told it is. */
     class Storable(val extension: String, val mimeType: String)
 
-    /**
-     * How to file a track of [codec], or null if this device won't have it.
-     *
-     * A source that can serve lossless does not thereby serve something Android
-     * will keep: the media store's audio collection accepts a closed list of
-     * MIME types, and one it doesn't recognise is refused outright at [begin] —
-     * which is a download that cannot start rather than one that sounds worse
-     * than hoped.
-     *
-     * Only asked of manifests now, whose segments [ManifestFile] joins into one
-     * of these. A plain file is named for what its opening bytes are — see
-     * [Downloader.Container] — because a codec label alone can't tell raw ADTS
-     * from AAC-in-MP4, and this table used to send every addon `aac` and `mp3`
-     * to YouTube for want of an entry.
-     *
-     * Kept as a table rather than derived from the codec string because two of
-     * these are not the identity mapping they look like. WAV's registered type
-     * is `audio/x-wav` on Android, and ALAC ships inside an MP4 container, so an
-     * ALAC file is an `.m4a` as far as both the store and [Mp4Tagger] are
-     * concerned — the tagger works on the box tree and never asks what the
-     * samples inside are.
-     */
     fun storable(codec: String?): Storable? = when (codec?.lowercase(Locale.ROOT)?.trim()) {
         "flac", "x-flac" -> Storable("flac", "audio/flac")
         "wav", "x-wav", "wave" -> Storable("wav", "audio/x-wav")
@@ -145,52 +118,51 @@ object DownloadStore {
 
     // ---- Lookup -------------------------------------------------------------
 
-    /**
-     * The uri of a file already saved under this name, or null.
-     *
-     * Worth asking before every download because the media store does not
-     * refuse a duplicate — it silently renames it to `… (1)`, and a user who
-     * taps download twice gets two copies rather than being told they already
-     * have one.
-     */
-    fun existing(context: Context, name: String): Uri? =
-        if (!AppSettings.exportDownloads.value) {
-            privateFile(context, name).takeIf { it.exists() }?.let(Uri::fromFile)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            mediaStoreEntry(context, name)
-        } else {
-            legacyFile(name).takeIf { it.exists() }?.let(Uri::fromFile)
+    fun existing(context: Context, name: String): Uri? {
+        val treeUri = AppSettings.localMusicFolderUri.value
+        if (treeUri.isNotBlank()) {
+            return findDocumentInTree(context, treeUri, name)
         }
+        val direct = File(defaultPublicDirectory(), name)
+        if (direct.isFile && direct.length() > 0L) return Uri.fromFile(direct)
+        return null
+    }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun mediaStoreEntry(context: Context, name: String): Uri? = runCatching {
-        context.contentResolver.query(
-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-            arrayOf(MediaStore.MediaColumns._ID),
-            "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND " +
-                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
-            arrayOf(name, "%$FOLDER%"),
-            null,
-        )?.use { cursor ->
-            if (!cursor.moveToFirst()) return@use null
-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.buildUpon()
-                .appendPath(cursor.getLong(0).toString())
-                .build()
+    private fun findDocumentInTree(context: Context, treeUriString: String, name: String): Uri? = runCatching {
+        val treeUri = Uri.parse(treeUriString)
+        val parentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_SIZE,
+        )
+        context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val sizeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+            if (idCol < 0 || nameCol < 0) return@use null
+            while (cursor.moveToNext()) {
+                val docName = cursor.getString(nameCol) ?: continue
+                if (docName.equals(name, ignoreCase = false)) {
+                    val size = if (sizeCol >= 0 && !cursor.isNull(sizeCol)) cursor.getLong(sizeCol) else 1L
+                    if (size > 0L) {
+                        return@use DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(idCol))
+                    }
+                }
+            }
+            null
         }
-    }.onFailure { Log.w(TAG, "media store lookup failed for $name: ${it.message}") }.getOrNull()
+    }.onFailure { Log.w(TAG, "SAF lookup failed for $name: ${it.message}") }.getOrNull()
 
-    /**
-     * Whether [uri] still names a file that is there.
-     *
-     * The record of what has been downloaded is kept by this app, but the files
-     * are not this app's to keep: they sit in a folder built for the user to
-     * manage, and one deleted from a file manager leaves the record behind
-     * claiming a download that no longer exists. Cheap to ask, and the answer
-     * is what stops the menu offering to delete nothing.
-     */
     fun exists(context: Context, uri: Uri): Boolean = runCatching {
-        if (uri.scheme == "file") return uri.path?.let { File(it).exists() } == true
-        context.contentResolver.openFileDescriptor(uri, "r")?.use { true } == true
+        if (uri.scheme == "file") {
+            val file = uri.path?.let(::File) ?: return false
+            return file.isFile && file.length() > 0L
+        }
+        context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+            pfd.statSize != 0L
+        } == true
     }.getOrDefault(false)
 
     fun delete(context: Context, uri: Uri): Boolean = runCatching {
@@ -199,121 +171,185 @@ object DownloadStore {
                 val file = File(path)
                 if (file.name == "playlist.m3u8" && file.parentFile?.parentFile?.name == "offline-hls") {
                     file.parentFile?.deleteRecursively() == true
-                } else file.delete()
+                } else {
+                    file.delete()
+                }
             } == true
+        } else if (DocumentsContract.isDocumentUri(context, uri)) {
+            DocumentsContract.deleteDocument(context.contentResolver, uri)
         } else {
             context.contentResolver.delete(uri, null, null) > 0
         }
     }.onFailure { Log.w(TAG, "could not delete $uri: ${it.message}") }.getOrDefault(false)
 
+    /** True when [uri] already lives inside the currently selected destination directory. */
+    fun isInCurrentTarget(context: Context, uri: Uri): Boolean {
+        val treeUri = AppSettings.localMusicFolderUri.value
+        if (treeUri.isNotBlank()) {
+            val parsedTree = Uri.parse(treeUri)
+            val treeId = runCatching { DocumentsContract.getTreeDocumentId(parsedTree) }.getOrNull()
+            if (uri.scheme == "content" && uri.authority == parsedTree.authority &&
+                treeId != null && DocumentsContract.isDocumentUri(context, uri)
+            ) {
+                val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+                if (docId != null && docId.substringBeforeLast('/', "") == treeId) return true
+            }
+            val selectedPath = LocalMediaRepository.selectedFolderAbsolutePath(treeUri)
+            val filePath = uri.takeIf { it.scheme == "file" }?.path
+            if (selectedPath != null && filePath != null) {
+                val targetCanonical = runCatching { File(selectedPath).canonicalPath }.getOrNull()
+                val fileParentCanonical = runCatching { File(filePath).parentFile?.canonicalPath }.getOrNull()
+                if (targetCanonical != null && targetCanonical.equals(fileParentCanonical, ignoreCase = true)) {
+                    return true
+                }
+            }
+            return false
+        }
+        if (uri.scheme != "file") return false
+        val parent = uri.path?.let(::File)?.parentFile ?: return false
+        return runCatching {
+            parent.canonicalPath.equals(defaultPublicDirectory().canonicalPath, ignoreCase = true)
+        }.getOrDefault(false)
+    }
+
     // ---- Writing ------------------------------------------------------------
 
     /**
-     * A destination that exists but is not yet a file anyone else can see.
-     *
-     * Every path out of here is either [commit] or [abort]; there is no third
-     * option, because the thing being protected against is a partial file
-     * surviving a failure and looking like a whole one.
+     * Stages bytes inside app cache first so conversion ([DownloadEncoder]) and metadata tagging
+     * ([MediaTagger]) always operate on a local seekable file before atomic publication to either
+     * `/storage/emulated/0/LuminaChord/Music` or the user's SAF `Local music folder`.
      */
     class Pending internal constructor(
         private val context: Context,
-        val uri: Uri,
         val name: String,
-        /** Set on the legacy path only: the `.part` file being written. */
-        private val part: File?,
-        /** Set on the legacy path only: what [part] is renamed to. */
-        private val target: File?,
+        private val mimeType: String,
+        val stagingFile: File,
+        private val treeUriString: String,
     ) {
-        /** The bytes being built, whether this is a MediaStore row or a legacy `.part` file. */
-        val tagUri: Uri get() = part?.let(Uri::fromFile) ?: uri
+        val tagUri: Uri get() = Uri.fromFile(stagingFile)
 
-        fun openStream(): OutputStream =
-            part?.outputStream()
-                ?: context.contentResolver.openOutputStream(uri)
-                ?: error("Could not open $name for writing")
+        fun openStream(): OutputStream {
+            stagingFile.parentFile?.mkdirs()
+            return stagingFile.outputStream().buffered()
+        }
 
-        /** @return the uri the finished file can be reached at. */
         fun commit(): Uri {
-            if (part != null && target != null) {
-                if (!part.renameTo(target)) error("Could not finish writing $name")
-                // Nothing indexes a file that simply appeared; without this it
-                // is on disk and invisible to every app that lists media.
+            check(stagingFile.isFile && stagingFile.length() > 0L) {
+                "Download failed: nothing was written"
+            }
+            try {
+                if (treeUriString.isNotBlank()) {
+                    check(hasTreeWritePermission(context, treeUriString)) {
+                        "Local music folder lacks write access — re-select the folder in Settings"
+                    }
+                    val treeUri = Uri.parse(treeUriString)
+                    val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(
+                        treeUri,
+                        DocumentsContract.getTreeDocumentId(treeUri),
+                    )
+                    findDocumentInTree(context, treeUriString, name)?.let { existingUri ->
+                        runCatching { DocumentsContract.deleteDocument(context.contentResolver, existingUri) }
+                    }
+                    val created = DocumentsContract.createDocument(
+                        context.contentResolver,
+                        parentDocUri,
+                        mimeType,
+                        name,
+                    ) ?: error("Could not create $name in selected Local music folder")
+                    try {
+                        context.contentResolver.openOutputStream(created, "w")?.use { out ->
+                            stagingFile.inputStream().use { input -> input.copyTo(out, 64 * 1024) }
+                        } ?: error("Could not open $name for writing")
+                    } catch (e: Throwable) {
+                        runCatching { DocumentsContract.deleteDocument(context.contentResolver, created) }
+                        throw e
+                    }
+                    return created
+                }
+
+                check(hasWriteAccess(context)) {
+                    context.getString(R.string.all_files_permission_required_save)
+                }
+                val dir = defaultPublicDirectory()
+                if (!dir.exists() && !dir.mkdirs()) {
+                    error("Could not create ${dir.absolutePath}")
+                }
+                val target = File(dir, name)
+                val part = File(dir, ".$name.part")
+                part.delete()
+                try {
+                    stagingFile.inputStream().use { input ->
+                        part.outputStream().buffered().use { out -> input.copyTo(out, 64 * 1024) }
+                    }
+                    if (target.exists()) target.delete()
+                    if (!part.renameTo(target)) error("Could not finish writing $name")
+                } catch (e: Throwable) {
+                    part.delete()
+                    throw e
+                }
                 MediaScannerConnection.scanFile(
                     context,
                     arrayOf(target.absolutePath),
-                    null,
+                    arrayOf(mimeType),
                     null,
                 )
                 return Uri.fromFile(target)
+            } finally {
+                stagingFile.delete()
             }
-            context.contentResolver.update(
-                uri,
-                ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
-                null,
-                null,
-            )
-            return uri
         }
 
         fun abort() {
-            part?.delete()
-            if (part == null) runCatching { context.contentResolver.delete(uri, null, null) }
+            stagingFile.delete()
         }
     }
 
-    /**
-     * Reserve [name] and return somewhere to write it.
-     *
-     * @throws IllegalStateException if the folder or the store row can't be
-     *   made — a failure worth surfacing, since every one of them means the
-     *   download cannot start rather than that it might not finish.
-     */
     fun begin(context: Context, name: String, mimeType: String): Pending {
-        if (!AppSettings.exportDownloads.value) {
-            val target = privateFile(context, name)
-            val folder = target.parentFile ?: error("No download folder")
-            if (!folder.exists() && !folder.mkdirs()) error("Could not create ${folder.path}")
-            val part = File(folder, ".$name.part")
-            part.delete()
-            return Pending(context, Uri.fromFile(target), name, part = part, target = target)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
+        val treeUri = AppSettings.localMusicFolderUri.value
+        if (treeUri.isNotBlank()) {
+            check(hasTreeWritePermission(context, treeUri)) {
+                "Local music folder lacks write access — re-select the folder in Settings"
             }
-            // A MIME type the audio collection doesn't recognise is not a null
-            // return but an IllegalArgumentException thrown from inside the
-            // resolver, several frames away from anything that names the
-            // download it belongs to. Every type written here came from
-            // [storable] or from the stream resolver, so landing in this branch
-            // means one of those two is wrong about this device — worth saying
-            // in those words the first time it happens again.
-            val uri = runCatching {
-                context.contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
-            }.getOrElse { cause ->
-                Log.w(TAG, "the media store refused $mimeType for $name: ${cause.message}")
-                error("Android won't store ${name.substringAfterLast('.', mimeType)} files in Music")
-            } ?: error("Could not create $name in Music")
-            return Pending(context, uri, name, part = null, target = null)
+        } else {
+            check(hasWriteAccess(context)) {
+                context.getString(R.string.all_files_permission_required_save)
+            }
         }
-
-        val target = legacyFile(name)
-        val folder = target.parentFile ?: error("No Music folder on this device")
-        if (!folder.exists() && !folder.mkdirs()) error("Could not create ${folder.path}")
-        val part = File(folder, "$name.part")
-        part.delete()
-        return Pending(context, Uri.fromFile(target), name, part = part, target = target)
+        val stageDir = File(context.cacheDir, "download-stage").apply { mkdirs() }
+        val safeStageName = "stage-${System.nanoTime()}-${name.replace(ILLEGAL, "_")}"
+        val stageFile = File(stageDir, safeStageName)
+        stageFile.delete()
+        return Pending(
+            context = context,
+            name = name,
+            mimeType = mimeType,
+            stagingFile = stageFile,
+            treeUriString = treeUri,
+        )
     }
 
-    @Suppress("DEPRECATION")
-    private fun legacyFile(name: String) = File(
-        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), FOLDER),
-        name,
-    )
-
-    private fun privateFile(context: Context, name: String) =
-        File(File(context.filesDir, "downloads"), name)
+    /** Copies an existing [sourceUri] into the active destination folder and returns its new [Uri]. */
+    fun importFile(context: Context, sourceUri: Uri, name: String, mimeType: String): Uri? {
+        if (!hasWriteAccess(context)) return null
+        existing(context, name)?.let { return it }
+        var pending: Pending? = null
+        return runCatching {
+            val dest = begin(context, name, mimeType)
+            pending = dest
+            val input = if (sourceUri.scheme == "file") {
+                File(requireNotNull(sourceUri.path)).inputStream()
+            } else {
+                context.contentResolver.openInputStream(sourceUri)
+            } ?: return null
+            input.use { src ->
+                dest.openStream().use { out -> src.copyTo(out, 64 * 1024) }
+            }
+            val committed = dest.commit()
+            pending = null
+            committed
+        }.onFailure {
+            pending?.abort()
+            Log.w(TAG, "migration copy failed for $name: ${it.message}")
+        }.getOrNull()
+    }
 }

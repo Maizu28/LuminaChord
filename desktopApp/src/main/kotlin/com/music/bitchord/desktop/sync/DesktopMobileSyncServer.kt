@@ -9,6 +9,7 @@ import com.music.bitchord.desktop.DesktopLocalArtwork
 import com.music.bitchord.desktop.DesktopLocalMusic
 import com.music.bitchord.desktop.DesktopPersistence
 import com.music.bitchord.desktop.DesktopPlaylist
+import com.music.bitchord.desktop.DesktopPlaylistStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -124,6 +125,7 @@ data class MobileSessionSnapshot(
     val repeatMode: Int = 0,
     val queueIndex: Int = 0,
     val songs: List<SyncedSongDto> = emptyList(),
+    val lyrics: DesktopLyricsSnapshot? = null,
     val receivedAtMs: Long = System.currentTimeMillis(),
 ) {
     fun estimatedPositionMs(nowMs: Long = System.currentTimeMillis()): Long {
@@ -168,6 +170,7 @@ data class SyncedSongDto(
     val albumName: String? = null,
     val isVideo: Boolean = false,
     val localPath: String? = null,
+    val fileName: String? = null,
 )
 
 @Serializable
@@ -175,12 +178,14 @@ data class SyncedPlaylistDto(
     val id: String,
     val title: String,
     val songs: List<SyncedSongDto> = emptyList(),
+    val kind: String = "local",
 )
 
 @Serializable
 private data class PairRequestDto(
     val device: String = "Android Device",
     val code: String = "",
+    val transport: String = "",
 )
 
 @Serializable
@@ -265,6 +270,8 @@ private data class PendingMobileCommandDto(
     val isPlaying: Boolean? = null,
     val shuffle: Boolean? = null,
     val repeatMode: Int? = null,
+    val playNext: Boolean? = null,
+    val song: SyncedSongDto? = null,
     val songs: List<SyncedSongDto>? = null,
 )
 
@@ -295,6 +302,7 @@ private data class MobileStatePushDto(
     val repeatMode: Int = 0,
     val queueIndex: Int = 0,
     val songs: List<SyncedSongDto> = emptyList(),
+    val lyrics: LyricsSnapshotDto? = null,
 )
 
 @Serializable
@@ -491,11 +499,15 @@ object DesktopMobileSyncServer {
     var onStructuredRemoteCommand: ((SyncRemoteCommand) -> Boolean)? = null
     var onHandoffToDesktop: ((songs: List<SyncedSongDto>, startIndex: Int, positionMs: Long, isPlaying: Boolean, shuffle: Boolean?, repeatMode: Int?) -> Boolean)? = null
     var onPrepareHandoffToMobile: (() -> DesktopHandoffState?)? = null
+    var onPauseDesktopPlayback: (() -> Unit)? = null
     var onSyncReceived: ((jsonPayload: String) -> Unit)? = null
     var librarySnapshotProvider: (() -> LibrarySyncData)? = null
     var onLibraryMergeReceived: ((LibrarySyncData) -> LibrarySyncData)? = null
     var onLocalMusicUpdated: (() -> Unit)? = null
+    var onPlaylistsUpdated: (() -> Unit)? = null
     var localSongsProvider: (() -> List<Song>)? = null
+    /** Validates whether USB loopback auto-pairing is allowed (active Sync + LuminaChord open on phone). */
+    var usbTunnelValidator: (() -> Boolean) = { AdbSyncManager.hasActiveAppTunnel() }
 
     fun init(savedPersistence: DesktopPersistence) {
         persistence = savedPersistence
@@ -597,6 +609,18 @@ object DesktopMobileSyncServer {
         _activeAudioOutput.value = target
     }
 
+    /** Ensures paired Mobile playback is paused & switched to Desktop mode whenever Desktop starts playing locally. */
+    fun notifyDesktopPlaybackStarted() {
+        val wasMobile = _activeAudioOutput.value == "mobile"
+        _activeAudioOutput.value = "desktop"
+        if (_connectedClients.value.isNotEmpty() && (wasMobile || _mobileSession.value?.isPlaying == true)) {
+            sendCommandToMobile(action = "pause_for_desktop_handoff")
+        }
+    }
+
+    fun songToRemoteDto(song: Song): SyncedSongDto =
+        song.toRemoteDto(getPrimaryIpAddress(), _port.value)
+
     /** Queues a playback/control command to be executed by the connected Android Mobile app. */
     fun sendCommandToMobile(
         action: String,
@@ -608,6 +632,8 @@ object DesktopMobileSyncServer {
         isPlaying: Boolean? = null,
         shuffle: Boolean? = null,
         repeatMode: Int? = null,
+        playNext: Boolean? = null,
+        song: SyncedSongDto? = null,
         songs: List<SyncedSongDto>? = null,
     ) {
         if (_connectedClients.value.isEmpty()) return
@@ -628,6 +654,8 @@ object DesktopMobileSyncServer {
                     isPlaying = isPlaying,
                     shuffle = shuffle,
                     repeatMode = repeatMode,
+                    playNext = playNext,
+                    song = song,
                     songs = songs,
                 ),
             )
@@ -637,13 +665,21 @@ object DesktopMobileSyncServer {
         }
     }
 
-    /** Switches audio output from Windows Desktop to the connected Android Mobile device with full queue/position handoff. */
-    fun switchOutputToMobile(): Boolean {
+    /** Switches audio output from Windows Desktop to the connected Android Mobile device, handing off playback if Desktop is active or attaching cleanly when Mobile is already playing. */
+    fun switchOutputToMobile(handoffIfDesktopPlaying: Boolean = true): Boolean {
         if (_connectedClients.value.isEmpty()) return false
         val primaryIp = getPrimaryIpAddress()
-        val snap = onPrepareHandoffToMobile?.invoke()
+        val desktopPlayingNow = nowPlayingProvider?.invoke()?.isPlaying == true
+        val mobile = _mobileSession.value
+        val shouldHandoff = handoffIfDesktopPlaying && (
+            desktopPlayingNow || mobile == null || mobile.title.isBlank()
+            )
         _activeAudioOutput.value = "mobile"
-        if (snap != null && snap.songs.isNotEmpty()) {
+        val snap = if (shouldHandoff) onPrepareHandoffToMobile?.invoke() else null
+        if (!shouldHandoff) {
+            onPauseDesktopPlayback?.invoke()
+        }
+        if (snap != null && snap.songs.isNotEmpty() && (snap.isPlaying || mobile == null || mobile.title.isBlank())) {
             val dtoSongs = snap.songs.map { it.toRemoteDto(primaryIp, _port.value) }
             sendCommandToMobile(
                 action = "handoff_play",
@@ -998,10 +1034,12 @@ object DesktopMobileSyncServer {
         val musicFolder = runCatching { DesktopLocalMusic.folder()?.toFile()?.canonicalFile?.toPath() }.getOrNull()
         val defaultMusic = runCatching { Paths.get(System.getProperty("user.home"), "Music").toFile().canonicalFile.toPath() }.getOrNull()
         val defaultDownloads = runCatching { Paths.get(System.getProperty("user.home"), "Downloads").toFile().canonicalFile.toPath() }.getOrNull()
+        val appDownloads = runCatching { com.music.bitchord.desktop.DesktopDownloadManager.directory().toFile().canonicalFile.toPath() }.getOrNull()
 
         if ((musicFolder != null && canonical.startsWith(musicFolder)) ||
             (defaultMusic != null && canonical.startsWith(defaultMusic)) ||
-            (defaultDownloads != null && canonical.startsWith(defaultDownloads))
+            (defaultDownloads != null && canonical.startsWith(defaultDownloads)) ||
+            (appDownloads != null && canonical.startsWith(appDownloads))
         ) {
             return true
         }
@@ -1163,8 +1201,14 @@ object DesktopMobileSyncServer {
         val req = runCatching { json.decodeFromString<PairRequestDto>(body) }.getOrNull() ?: PairRequestDto()
         val codeReceived = req.code.trim()
         val deviceName = req.device.ifBlank { "Android Device" }
+        val isLoopback = clientIp == "127.0.0.1" || clientIp == "::1" || clientIp == "0:0:0:0:0:0:0:1"
+        val trustedUsbTunnel = isLoopback &&
+            req.transport.equals("usb", ignoreCase = true) &&
+            _isEnabled.value &&
+            _isRunning.value &&
+            usbTunnelValidator.invoke()
 
-        if (_requirePairingCode.value && codeReceived != _pairingCode.value) {
+        if (_requirePairingCode.value && !trustedUsbTunnel && codeReceived != _pairingCode.value) {
             val errJson = """{"status":"error","message":"Kode pairing (PIN) salah! Periksa PIN di LuminaChord Desktop"}"""
             sendHttpResponse(output, 403, "Forbidden", "application/json", errJson)
             _lastActionMessage.value = "Percobaan koneksi ditolak dari $deviceName ($clientIp): PIN tidak valid"
@@ -1172,7 +1216,8 @@ object DesktopMobileSyncServer {
         }
 
         registerOrTouchClient(clientIp, deviceName)
-        _lastActionMessage.value = "Terhubung dengan $deviceName ($clientIp)"
+        val displayEndpoint = if (trustedUsbTunnel) "USB Terhubung" else clientIp
+        _lastActionMessage.value = "Terhubung dengan $deviceName ($displayEndpoint)"
 
         val now = System.currentTimeMillis()
         val resJson = """{"status":"success","deviceName":"LuminaChord Desktop (Windows)","message":"Berhasil terhubung dengan LuminaChord Desktop","serverTime":$now}"""
@@ -1264,6 +1309,23 @@ object DesktopMobileSyncServer {
         val req = runCatching { json.decodeFromString<MobileStatePushDto>(body) }.getOrNull()
         if (req != null) {
             registerOrTouchClient(clientIp, req.deviceName.ifBlank { "Android Device" })
+            val prev = _mobileSession.value
+            val resolvedLyrics = req.lyrics?.toDomain()
+                ?: prev?.lyrics?.takeIf { prev.videoId == req.videoId && req.videoId.isNotBlank() }
+
+            // Auto-follow Mobile when Android starts playing while Desktop is not actively playing locally.
+            if (req.isPlaying && req.title.isNotBlank() && _activeAudioOutput.value != "mobile") {
+                val desktopPlaying = nowPlayingProvider?.invoke()?.isPlaying == true
+                if (!desktopPlaying) {
+                    _activeAudioOutput.value = "mobile"
+                    onPauseDesktopPlayback?.invoke()
+                }
+            } else if (req.isPlaying && _activeAudioOutput.value == "mobile") {
+                if (nowPlayingProvider?.invoke()?.isPlaying == true) {
+                    onPauseDesktopPlayback?.invoke()
+                }
+            }
+
             _mobileSession.value = MobileSessionSnapshot(
                 deviceName = req.deviceName.ifBlank { "Android Device" },
                 videoId = req.videoId,
@@ -1279,6 +1341,7 @@ object DesktopMobileSyncServer {
                 repeatMode = req.repeatMode,
                 queueIndex = req.queueIndex,
                 songs = req.songs,
+                lyrics = resolvedLyrics,
                 receivedAtMs = System.currentTimeMillis(),
             )
         }
@@ -1610,13 +1673,51 @@ object DesktopMobileSyncServer {
         id = id,
         title = title,
         songs = songs.map { it.toDto() },
+        kind = DesktopPlaylistStore.kindFor(id),
     )
 
-    private fun SyncedPlaylistDto.toDesktopPlaylist(): DesktopPlaylist = DesktopPlaylist(
-        id = id.ifBlank { UUID.randomUUID().toString() },
-        title = title.ifBlank { "Synced Playlist" },
-        songs = songs.map { it.toSong() },
-    )
+    private fun SyncedPlaylistDto.toDesktopPlaylist(): DesktopPlaylist {
+        val resolvedId = id.ifBlank { UUID.randomUUID().toString() }
+        DesktopPlaylistStore.rememberKind(resolvedId, kind)
+        var lazyLocalSongs: List<Song>? = null
+        fun localCatalog(): List<Song> {
+            val cached = lazyLocalSongs
+            if (cached != null) return cached
+            return currentLocalSongs().also { lazyLocalSongs = it }
+        }
+        return DesktopPlaylist(
+            id = resolvedId,
+            title = title.ifBlank { "Synced Playlist" },
+            songs = songs.map { dto ->
+                val base = dto.toSong()
+                val rawPath = dto.localPath?.takeIf { it.isNotBlank() }
+                val existsOnPc = rawPath != null && runCatching { Files.isRegularFile(Path.of(rawPath)) }.getOrDefault(false)
+                if (existsOnPc) {
+                    base
+                } else if (dto.videoId.startsWith("local:") || rawPath != null || !dto.fileName.isNullOrBlank()) {
+                    val wantedName = dto.fileName?.takeIf { it.isNotBlank() }
+                        ?: rawPath?.substringAfterLast('/')?.substringAfterLast('\\')?.takeIf { it.isNotBlank() }
+                    val matched = localCatalog().firstOrNull { candidate ->
+                        val candName = candidate.localPath?.let { File(it).name }
+                        (wantedName != null && candName != null && candName.equals(wantedName, ignoreCase = true)) ||
+                            (candidate.title.equals(dto.title, ignoreCase = true) &&
+                                (dto.artist.isBlank() || candidate.artist.equals(dto.artist, ignoreCase = true)))
+                    }
+                    if (matched != null) {
+                        base.copy(
+                            videoId = if (base.videoId.isBlank() || base.videoId.startsWith("local:")) matched.videoId else base.videoId,
+                            localPath = matched.localPath,
+                            thumbnailUrl = base.thumbnailUrl ?: matched.thumbnailUrl,
+                        )
+                    } else {
+                        base
+                    }
+                } else {
+                    base
+                }
+            },
+        )
+    }
 
     private fun Song.toRemoteDto(primaryIp: String, port: Int): SyncedSongDto {
         val thumb = thumbnailUrl?.let { raw ->
@@ -1640,6 +1741,39 @@ object DesktopMobileSyncServer {
             localPath = localPath,
         )
     }
+
+    private fun LyricsSnapshotDto.toDomain(): DesktopLyricsSnapshot = DesktopLyricsSnapshot(
+        version = version,
+        videoId = videoId,
+        source = source,
+        loading = loading,
+        unavailable = unavailable,
+        lines = lines.map { it.toDomain() },
+    )
+
+    private fun LyricWordDto.toDomain(): LyricWord = LyricWord(
+        startMs = startMs,
+        endMs = endMs,
+        text = text,
+        syllables = syllables.map { LyricSyllable(it.startMs, it.endMs, it.startChar, it.endChar) },
+    )
+
+    private fun LyricLineDto.toDomain(): LyricLine = LyricLine(
+        timeMs = timeMs,
+        text = text,
+        words = words.map { it.toDomain() },
+        sungUntilMs = sungUntilMs,
+        alignment = if (alignment.equals("End", ignoreCase = true)) LyricAlignment.End else LyricAlignment.Start,
+        background = background?.let { bg ->
+            LyricLine(
+                timeMs = bg.timeMs,
+                text = bg.text,
+                words = bg.words.map { it.toDomain() },
+                sungUntilMs = bg.sungUntilMs,
+                alignment = if (bg.alignment.equals("End", ignoreCase = true)) LyricAlignment.End else LyricAlignment.Start,
+            )
+        },
+    )
 
     private fun LyricWord.toDto(): LyricWordDto = LyricWordDto(
         startMs = startMs,
@@ -1675,6 +1809,8 @@ object DesktopMobileSyncServer {
         albumId = albumId,
         albumName = albumName,
         isVideo = isVideo,
+        localPath = localPath,
+        fileName = localPath?.takeIf { it.isNotBlank() }?.let { runCatching { File(it).name }.getOrNull() },
     )
 
     private fun SyncedSongDto.toSong(): Song = Song(
@@ -1687,6 +1823,7 @@ object DesktopMobileSyncServer {
         albumId = albumId,
         albumName = albumName,
         isVideo = isVideo,
+        localPath = localPath,
     )
 
     fun formatLastSynced(timestamp: Long?): String {

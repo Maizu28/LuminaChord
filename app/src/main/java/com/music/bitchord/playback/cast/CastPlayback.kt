@@ -42,6 +42,9 @@ interface CastSink {
 
     /** The receiver's volume changed, from here or from its own remote. */
     fun onRemoteVolumeChanged()
+
+    /** The remote track, queue, metadata, or toggle state changed independently of local playback. */
+    fun onRemoteTrackOrQueueChanged() {}
 }
 
 /**

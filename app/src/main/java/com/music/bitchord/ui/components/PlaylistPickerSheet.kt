@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import com.music.bitchord.ui.icons.SfIcons
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
@@ -116,6 +117,9 @@ fun PlaylistPickerSheet(
     song: Song? = null,
     startCreating: Boolean = false,
     offline: Boolean = false,
+    signedIn: Boolean = true,
+    localSavePathLabel: String? = null,
+    onCreateLocal: ((String) -> Unit)? = null,
     headerTitle: String? = null,
     songs: List<Song> = emptyList(),
 ) {
@@ -175,6 +179,11 @@ fun PlaylistPickerSheet(
                     onClose = { closeAfter {} },
                     onCreate = { name, privacy -> closeAfter { onCreate(name, privacy) } },
                     offline = offline,
+                    signedIn = signedIn,
+                    localSavePathLabel = localSavePathLabel,
+                    onCreateLocal = onCreateLocal?.let { localHandler ->
+                        { name -> closeAfter { localHandler(name) } }
+                    },
                 )
             } else {
                 SheetTopBar(
@@ -418,9 +427,15 @@ private fun NewPlaylistForm(
     onClose: () -> Unit,
     onCreate: (String, PlaylistPrivacy) -> Unit,
     offline: Boolean,
+    signedIn: Boolean = true,
+    localSavePathLabel: String? = null,
+    onCreateLocal: ((String) -> Unit)? = null,
 ) {
     var name by remember { mutableStateOf("") }
     var privacy by remember { mutableStateOf(PlaylistPrivacy.PRIVATE) }
+    var saveLocal by remember(offline, signedIn, onCreateLocal) {
+        mutableStateOf(offline || (!signedIn && onCreateLocal != null))
+    }
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
 
@@ -431,7 +446,11 @@ private fun NewPlaylistForm(
     val submit: () -> Unit = {
         if (name.isNotBlank()) {
             focusManager.clearFocus()
-            onCreate(name, privacy)
+            if (saveLocal && onCreateLocal != null) {
+                onCreateLocal(name)
+            } else {
+                onCreate(name, privacy)
+            }
         }
     }
 
@@ -454,11 +473,15 @@ private fun NewPlaylistForm(
                         color = MaterialTheme.colorScheme.onBackground,
                     )
                     Text(
-                        text = stringResource(
-                            if (offline) R.string.saved_on_this_device else R.string.saved_to_youtube_music_account,
-                        ),
+                        text = if (saveLocal) {
+                            localSavePathLabel ?: stringResource(R.string.saved_on_this_device)
+                        } else {
+                            stringResource(R.string.saved_to_youtube_music_account)
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             },
@@ -514,8 +537,30 @@ private fun NewPlaylistForm(
             }
         }
 
-        // A playlist on the device is seen by whoever holds the device.
-        if (!offline) {
+        // Destination toggle when signed in and local saving is available;
+        // a playlist on the device is seen by whoever holds the device.
+        if (!offline && onCreateLocal != null && signedIn) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 22.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                PrivacyPill(
+                    icon = Icons.Rounded.Public,
+                    label = "YouTube Music",
+                    selected = !saveLocal,
+                    onClick = { saveLocal = false },
+                )
+                PrivacyPill(
+                    icon = Icons.Rounded.Folder,
+                    label = stringResource(R.string.saved_on_this_device),
+                    selected = saveLocal,
+                    onClick = { saveLocal = true },
+                )
+            }
+        }
+        if (!saveLocal) {
             SheetHeading(stringResource(R.string.who_can_see_it).uppercase(Locale.getDefault()))
             Row(
                 modifier = Modifier

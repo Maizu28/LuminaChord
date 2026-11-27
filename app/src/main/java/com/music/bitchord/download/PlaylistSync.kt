@@ -356,13 +356,10 @@ object PlaylistSync {
     }
 
     /**
-     * Below Android 10 an exported download needs a permission only a window can
-     * ask for, and every track would fail for the want of it.
+     * Only starts background downloads when the configured public folder has write access.
      */
     private fun storageWritable(context: Context): Boolean =
-        !AppSettings.exportDownloads.value || !DownloadStore.needsLegacyPermission() ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
-            PackageManager.PERMISSION_GRANTED
+        DownloadStore.hasWriteAccess(context)
 
     // ---- Reading a playlist -------------------------------------------------
 

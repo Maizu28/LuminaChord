@@ -366,4 +366,254 @@ class DesktopMobileSyncServerTest {
             DesktopMobileSyncServer.stopServer()
         }
     }
+
+    @Test
+    fun testMobileStatePushWithLyricsAutoSwitchAndDesktopControls() {
+        val port = freePort()
+        DesktopMobileSyncServer.stopServer()
+        DesktopMobileSyncServer.setRequirePairingCode(false)
+        DesktopMobileSyncServer.setPort(port)
+        DesktopMobileSyncServer.setActiveOutputLocal("desktop")
+        DesktopMobileSyncServer.nowPlayingProvider = {
+            DesktopNowPlayingInfo(title = "Idle Song", artist = "Artist", isPlaying = false)
+        }
+
+        DesktopMobileSyncServer.startServer()
+        var online = false
+        for (i in 0 until 30) {
+            if (DesktopMobileSyncServer.isRunning.value) {
+                online = true
+                break
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(online)
+
+        try {
+            // 1. Mobile pushes playback state with synced lyrics while desktop is paused
+            val push1 = (URL("http://127.0.0.1:$port/api/mobile/state").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+            OutputStreamWriter(push1.outputStream, StandardCharsets.UTF_8).use {
+                it.write(
+                    """
+                    {
+                      "deviceName": "Pixel 9",
+                      "videoId": "mob1",
+                      "title": "Cupid",
+                      "artist": "FIFTY FIFTY",
+                      "durationMs": 174000,
+                      "positionMs": 12500,
+                      "isPlaying": true,
+                      "volume": 0.65,
+                      "shuffle": true,
+                      "repeatMode": 2,
+                      "queueIndex": 0,
+                      "songs": [{"videoId": "mob1", "title": "Cupid", "artist": "FIFTY FIFTY"}],
+                      "lyrics": {
+                        "version": 1,
+                        "videoId": "mob1",
+                        "source": "LrcLib",
+                        "loading": false,
+                        "unavailable": false,
+                        "lines": [{"timeMs": 12000, "text": "A hopeless romantic all my life", "words": [{"startMs": 12000, "endMs": 12400, "text": "A"}]}]
+                      }
+                    }
+                    """.trimIndent(),
+                )
+            }
+            assertEquals(200, push1.responseCode)
+            assertEquals("mobile", DesktopMobileSyncServer.activeAudioOutput.value)
+            val snap1 = DesktopMobileSyncServer.mobileSession.value
+            assertEquals("Cupid", snap1?.title)
+            assertEquals(1, snap1?.lyrics?.lines?.size)
+            assertEquals("A hopeless romantic all my life", snap1?.lyrics?.lines?.first()?.text)
+
+            // 2. Subsequent lightweight position push omits lyrics, server preserves cached lyrics for same track
+            val push2 = (URL("http://127.0.0.1:$port/api/mobile/state").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+            OutputStreamWriter(push2.outputStream, StandardCharsets.UTF_8).use {
+                it.write("""{"deviceName":"Pixel 9","videoId":"mob1","title":"Cupid","artist":"FIFTY FIFTY","durationMs":174000,"positionMs":14500,"isPlaying":true}""")
+            }
+            assertEquals(200, push2.responseCode)
+            val snap2 = DesktopMobileSyncServer.mobileSession.value
+            assertEquals(14_500L, snap2?.positionMs)
+            assertEquals(1, snap2?.lyrics?.lines?.size)
+
+            // 3. Desktop queues control commands (play_pause, set_shuffle, set_repeat, seek) for Android to pick up
+            DesktopMobileSyncServer.sendCommandToMobile("play_pause")
+            DesktopMobileSyncServer.sendCommandToMobile("set_shuffle", shuffle = false, value = "false")
+            DesktopMobileSyncServer.sendCommandToMobile("seek", positionMs = 42_000L)
+            val st = (URL("http://127.0.0.1:$port/api/status").openConnection() as HttpURLConnection)
+                .inputStream.bufferedReader(StandardCharsets.UTF_8).readText()
+            assertTrue(st.contains("\"action\":\"play_pause\""))
+            assertTrue(st.contains("\"action\":\"set_shuffle\""))
+            assertTrue(st.contains("\"action\":\"seek\""))
+            assertTrue(st.contains("\"positionMs\":42000"))
+
+            // 4. Switching to mobile while mobile is already playing attaches instead of overwriting mobile's queue
+            DesktopMobileSyncServer.setActiveOutputLocal("desktop")
+            assertTrue(DesktopMobileSyncServer.switchOutputToMobile())
+            val stAttach = (URL("http://127.0.0.1:$port/api/status").openConnection() as HttpURLConnection)
+                .inputStream.bufferedReader(StandardCharsets.UTF_8).readText()
+            assertTrue(stAttach.contains("\"action\":\"select_mobile_output\""))
+            assertFalse(stAttach.contains("\"action\":\"handoff_play\""))
+        } finally {
+            DesktopMobileSyncServer.nowPlayingProvider = null
+            DesktopMobileSyncServer.setActiveOutputLocal("desktop")
+            DesktopMobileSyncServer.stopServer()
+        }
+    }
+
+    @Test
+    fun testUsbTunnelPairingRequiresOpenAppOnPhone() {
+        val port = freePort()
+        DesktopMobileSyncServer.setEnabled(false)
+        DesktopMobileSyncServer.disconnectAllClients()
+        DesktopMobileSyncServer.setRequirePairingCode(true)
+        DesktopMobileSyncServer.setCustomPairingCode("5678")
+        DesktopMobileSyncServer.setPort(port)
+        DesktopMobileSyncServer.setEnabled(true)
+
+        var online = false
+        for (i in 0 until 40) {
+            if (DesktopMobileSyncServer.isRunning.value) {
+                online = true
+                break
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(online, "Sync server should listen on $port")
+
+        // Pure PID parser tests for Android LuminaChord process check
+        val adbCls = com.music.bitchord.desktop.sync.AdbSyncManager
+        assertFalse(adbCls.isPidofOutputRunning(""))
+        assertFalse(adbCls.isPidofOutputRunning("   \n"))
+        assertFalse(adbCls.isPidofOutputRunning("/system/bin/sh: pidof: inaccessible"))
+        assertTrue(adbCls.isPidofOutputRunning("18422"))
+        assertTrue(adbCls.isPidofOutputRunning("18422 18490\n"))
+        assertFalse(adbCls.hasActiveAppTunnel())
+
+        val originalValidator = DesktopMobileSyncServer.usbTunnelValidator
+        try {
+            // 1. USB loopback request without active LuminaChord USB tunnel must still be rejected (403)
+            DesktopMobileSyncServer.usbTunnelValidator = { false }
+            val rejectedConn = (URL("http://127.0.0.1:$port/api/pair").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+            OutputStreamWriter(rejectedConn.outputStream, StandardCharsets.UTF_8).use {
+                it.write("""{"device":"Unknown USB Phone","code":"","transport":"usb"}""")
+            }
+            assertEquals(403, rejectedConn.responseCode)
+
+            // 2. When Sync is active AND LuminaChord is confirmed running on the USB phone, auto-pair succeeds
+            DesktopMobileSyncServer.usbTunnelValidator = { true }
+            val acceptedConn = (URL("http://127.0.0.1:$port/api/pair").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+            OutputStreamWriter(acceptedConn.outputStream, StandardCharsets.UTF_8).use {
+                it.write("""{"device":"Galaxy S24","code":"","transport":"usb"}""")
+            }
+            assertEquals(200, acceptedConn.responseCode)
+            assertTrue(DesktopMobileSyncServer.connectedClients.value.any { it.deviceName == "Galaxy S24" })
+        } finally {
+            DesktopMobileSyncServer.usbTunnelValidator = originalValidator
+            DesktopMobileSyncServer.stopServer()
+        }
+    }
+
+    @Test
+    fun testUnifiedSingleActivePlaybackRouting() {
+        val port = freePort()
+        DesktopMobileSyncServer.setEnabled(false)
+        DesktopMobileSyncServer.disconnectAllClients()
+        DesktopMobileSyncServer.setRequirePairingCode(false)
+        DesktopMobileSyncServer.setPort(port)
+        DesktopMobileSyncServer.setEnabled(true)
+
+        var online = false
+        for (i in 0 until 40) {
+            if (DesktopMobileSyncServer.isRunning.value) {
+                online = true
+                break
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(online)
+
+        var desktopPausedCount = 0
+        var desktopPlaying = false
+        DesktopMobileSyncServer.nowPlayingProvider = {
+            DesktopNowPlayingInfo(title = "Track PC", artist = "Artist", isPlaying = desktopPlaying)
+        }
+        DesktopMobileSyncServer.onPauseDesktopPlayback = { desktopPausedCount++ }
+
+        try {
+            // Pair mobile
+            val pairConn = (URL("http://127.0.0.1:$port/api/pair").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+            OutputStreamWriter(pairConn.outputStream, StandardCharsets.UTF_8).use {
+                it.write("""{"device":"OPPO CPH2565"}""")
+            }
+            assertEquals(200, pairConn.responseCode)
+
+            // 1. Mobile starts playing "ocean eyes" while Desktop is paused -> Desktop follows "mobile" output & ensures PC is paused
+            val pushConn = (URL("http://127.0.0.1:$port/api/mobile/state").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+            OutputStreamWriter(pushConn.outputStream, StandardCharsets.UTF_8).use {
+                it.write("""{"deviceName":"OPPO CPH2565","videoId":"ocean_id","title":"ocean eyes","artist":"Billie Eilish","isPlaying":true}""")
+            }
+            assertEquals(200, pushConn.responseCode)
+            assertEquals("mobile", DesktopMobileSyncServer.activeAudioOutput.value)
+            assertTrue(desktopPausedCount >= 1)
+
+            // 2. Picking a track on Desktop while in mobile output queues "play_song" / "enqueue_song" for Mobile instead of switching output
+            DesktopMobileSyncServer.sendCommandToMobile(
+                action = "play_song",
+                isPlaying = true,
+                song = SyncedSongDto(videoId = "back_id", title = "Backburner", artist = "NIKI"),
+            )
+            DesktopMobileSyncServer.sendCommandToMobile(
+                action = "enqueue_song",
+                playNext = true,
+                song = SyncedSongDto(videoId = "next_id", title = "Next Track", artist = "Artist"),
+            )
+            assertEquals("mobile", DesktopMobileSyncServer.activeAudioOutput.value)
+            val st1 = (URL("http://127.0.0.1:$port/api/status").openConnection() as HttpURLConnection)
+                .inputStream.bufferedReader(StandardCharsets.UTF_8).readText()
+            assertTrue(st1.contains("\"action\":\"play_song\""))
+            assertTrue(st1.contains("\"title\":\"Backburner\""))
+            assertTrue(st1.contains("\"action\":\"enqueue_song\""))
+            assertTrue(st1.contains("\"playNext\":true"))
+
+            // 3. Starting local playback on Desktop pauses paired Mobile so both devices never play separate songs
+            desktopPlaying = true
+            DesktopMobileSyncServer.notifyDesktopPlaybackStarted()
+            assertEquals("desktop", DesktopMobileSyncServer.activeAudioOutput.value)
+            val st2 = (URL("http://127.0.0.1:$port/api/status").openConnection() as HttpURLConnection)
+                .inputStream.bufferedReader(StandardCharsets.UTF_8).readText()
+            assertTrue(st2.contains("\"action\":\"pause_for_desktop_handoff\""))
+        } finally {
+            DesktopMobileSyncServer.nowPlayingProvider = null
+            DesktopMobileSyncServer.onPauseDesktopPlayback = null
+            DesktopMobileSyncServer.disconnectAllClients()
+            DesktopMobileSyncServer.setActiveOutputLocal("desktop")
+            DesktopMobileSyncServer.stopServer()
+        }
+    }
 }

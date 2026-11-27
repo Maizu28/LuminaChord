@@ -20,7 +20,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.Cable
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Computer
@@ -40,7 +39,6 @@ import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.Sync
-import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -74,6 +72,7 @@ import com.music.bitchord.desktop.DesktopAccent
 import com.music.bitchord.desktop.DesktopCardEdge
 import com.music.bitchord.desktop.DesktopDialogPanel
 import com.music.bitchord.desktop.DesktopLocalMusic
+import com.music.bitchord.desktop.DesktopPlaylistStore
 import com.music.bitchord.desktop.DesktopSecondary
 import com.music.bitchord.desktop.DesktopShortcutSettings
 import com.music.bitchord.desktop.LocalDesktopPanelIsPage
@@ -105,13 +104,7 @@ fun DesktopMobileSyncScreen(onDismiss: () -> Unit) {
     val activeAudioOutput by DesktopMobileSyncServer.activeAudioOutput.collectAsState()
     val mobileSession by DesktopMobileSyncServer.mobileSession.collectAsState()
 
-    // ADB state
-    val isAdbAvailable by AdbSyncManager.isAdbAvailable.collectAsState()
-    val adbDevices by AdbSyncManager.connectedDevices.collectAsState()
-    val isAdbReverseActive by AdbSyncManager.isReverseActive.collectAsState()
-    val isAdbSyncing by AdbSyncManager.isSyncing.collectAsState()
-    val adbMessage by AdbSyncManager.lastMessage.collectAsState()
-    val autoSyncAdb by AdbSyncManager.autoSyncOnConnect.collectAsState()
+    // No USB/ADB state exposed in UI — USB sync runs automatically in the backend when both apps are open.
 
     val preferredIp by DesktopMobileSyncServer.preferredIp.collectAsState()
     var availableIps by remember { mutableStateOf(DesktopMobileSyncServer.getLocalIpAddresses()) }
@@ -402,6 +395,11 @@ fun DesktopMobileSyncScreen(onDismiss: () -> Unit) {
                                         color = DesktopSecondary,
                                         style = MaterialTheme.typography.bodySmall,
                                     )
+                                    Text(
+                                        "Playlist lokal: ${DesktopPlaylistStore.directoryLabel()}",
+                                        color = DesktopSecondary,
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
                                 }
                                 Button(
                                     onClick = {
@@ -444,14 +442,10 @@ fun DesktopMobileSyncScreen(onDismiss: () -> Unit) {
                                         mergeStatus = "Menyiapkan dan memindai pustaka musik lokal..."
                                         scope.launch {
                                             localMusicCount = DesktopLocalMusic.scan().size
-                                            if (adbDevices.isNotEmpty() && isAdbAvailable) {
-                                                AdbSyncManager.syncMusic(AdbSyncDirection.TWO_WAY_MERGE) { stepMsg ->
-                                                    mergeStatus = stepMsg
-                                                }
-                                            } else if (clients.isNotEmpty()) {
-                                                mergeStatus = "Pustaka ($localMusicCount lagu) siap! Tekan tombol 'Merge' di aplikasi Android untuk menyatukan lagu lewat Wi-Fi."
+                                            mergeStatus = if (clients.isNotEmpty()) {
+                                                "Pustaka ($localMusicCount lagu) siap! Tekan tombol 'Merge Musik Lokal' di aplikasi Android untuk menyatukan lagu lewat Wi-Fi."
                                             } else {
-                                                mergeStatus = "Pustaka ($localMusicCount lagu) siap dimerge. Hubungkan HP via QR Code / ADB terlebih dahulu."
+                                                "Pustaka ($localMusicCount lagu) siap dimerge. Hubungkan HP ke LuminaChord Sync terlebih dahulu."
                                             }
                                             isMerging = false
                                         }
@@ -484,137 +478,7 @@ fun DesktopMobileSyncScreen(onDismiss: () -> Unit) {
 
                     Spacer(Modifier.height(18.dp))
 
-                    // Section 4: ADB Auto-Sync
-                    Text(
-                        "SINKRONISASI OTOMATIS VIA ADB (USB & WI-FI DEBUGGING)",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = DesktopSecondary,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(vertical = 4.dp),
-                    )
-
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(Color.White.copy(alpha = 0.04f))
-                            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(14.dp))
-                            .padding(16.dp),
-                    ) {
-                        Column {
-                            Row(
-                                Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Box(
-                                    Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(
-                                        if (isAdbAvailable) Color(0xFF4CAF50).copy(alpha = 0.18f) else Color(0xFFFF5252).copy(alpha = 0.18f)
-                                    ),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Icon(
-                                        Icons.Rounded.Usb,
-                                        null,
-                                        tint = if (isAdbAvailable) Color(0xFF81C784) else Color(0xFFFF8A80),
-                                        modifier = Modifier.size(20.dp),
-                                    )
-                                }
-                                Spacer(Modifier.width(12.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        if (isAdbAvailable) "ADB Siap Digunakan" else "ADB Belum Terdeteksi",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                    Text(
-                                        if (adbDevices.isNotEmpty()) "${adbDevices.size} perangkat terdeteksi: ${adbDevices.joinToString { it.displayName }}"
-                                        else if (isAdbAvailable) "Hubungkan HP via kabel USB (aktifkan USB Debugging)"
-                                        else "Install Android SDK platform-tools atau pastikan adb.exe ada di PATH",
-                                        color = DesktopSecondary,
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
-                                }
-                                IconButton(onClick = { AdbSyncManager.refreshDevices() }) {
-                                    Icon(Icons.Rounded.Refresh, "Refresh Perangkat ADB", tint = DesktopAccent)
-                                }
-                            }
-
-                            if (isAdbAvailable) {
-                                Spacer(Modifier.height(12.dp))
-                                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-                                Spacer(Modifier.height(10.dp))
-
-                                // Auto-sync switch
-                                Row(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .desktopRowClickable { AdbSyncManager.setAutoSyncOnConnect(!autoSyncAdb) }
-                                        .padding(vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text("Auto-Sync Otomatis saat HP Terhubung via ADB", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
-                                        Text("Otomatis sinkronkan file musik baru ketika HP dicolokkan ke laptop/PC", color = DesktopSecondary, style = MaterialTheme.typography.labelSmall)
-                                    }
-                                    Switch(
-                                        checked = autoSyncAdb,
-                                        onCheckedChange = { AdbSyncManager.setAutoSyncOnConnect(it) },
-                                        colors = desktopSwitchColors(),
-                                    )
-                                }
-
-                                Spacer(Modifier.height(10.dp))
-
-                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                    Button(
-                                        onClick = { AdbSyncManager.setupPortForwarding(port) },
-                                        modifier = Modifier.weight(1f),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = if (isAdbReverseActive) Color(0xFF4CAF50).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.08f),
-                                        ),
-                                        shape = RoundedCornerShape(8.dp),
-                                    ) {
-                                        Icon(Icons.Rounded.Cable, null, modifier = Modifier.size(15.dp), tint = if (isAdbReverseActive) Color(0xFF81C784) else Color.White)
-                                        Spacer(Modifier.width(6.dp))
-                                        Text(
-                                            if (isAdbReverseActive) "USB Tunnel Aktif (:$port)" else "Aktifkan USB Tunnel ($port)",
-                                            fontSize = 11.sp,
-                                            color = if (isAdbReverseActive) Color(0xFF81C784) else Color.White,
-                                        )
-                                    }
-
-                                    Button(
-                                        onClick = { AdbSyncManager.syncMusic(AdbSyncDirection.TWO_WAY_MERGE) },
-                                        enabled = !isAdbSyncing && adbDevices.isNotEmpty(),
-                                        modifier = Modifier.weight(1f),
-                                        colors = ButtonDefaults.buttonColors(containerColor = DesktopAccent),
-                                        shape = RoundedCornerShape(8.dp),
-                                    ) {
-                                        if (isAdbSyncing) {
-                                            CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp, color = Color.White)
-                                        } else {
-                                            Icon(Icons.Rounded.Sync, null, modifier = Modifier.size(15.dp), tint = Color.White)
-                                        }
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("Merge 2-Arah via ADB", fontSize = 11.sp, color = Color.White)
-                                    }
-                                }
-
-                                if (adbMessage != null) {
-                                    Spacer(Modifier.height(8.dp))
-                                    Text(
-                                        adbMessage.orEmpty(),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = DesktopSecondary,
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(18.dp))
-
-                    // Section 5: Connected Clients List
+                    // Section 4: Connected Clients List
                     Text(
                         "PERANGKAT MOBILE AKTIF TERHUBUNG",
                         style = MaterialTheme.typography.labelSmall,
@@ -786,6 +650,12 @@ fun DesktopMobileSyncScreen(onDismiss: () -> Unit) {
                                             )
                                         }
                                     }
+                                    Spacer(Modifier.height(6.dp))
+                                    Text(
+                                        "Player bar, layar penuh, antrean & panel lirik di Desktop mengikuti lagu HP saat mode Mobile aktif.",
+                                        color = DesktopSecondary,
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
                                 }
                             }
                         }
